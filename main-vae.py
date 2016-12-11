@@ -1,5 +1,3 @@
-'''TensorFlow implementation of http://arxiv.org/pdf/1312.6114v10.pdf'''
-
 from __future__ import absolute_import, division, print_function
 
 import math
@@ -7,74 +5,36 @@ import os
 
 import numpy as np
 import prettytensor as pt
-from prettytensor import layers
-import collections
+
+
 import scipy.misc
 import tensorflow as tf
 from scipy.misc import imsave
 from tensorflow.examples.tutorials.mnist import input_data
 from util.dataset import make_dataset
+from util.layers import transposed_fully_connected
+from util.metrics import cluster_acc, cluster_nmi
 
 from deconv import deconv2d
 from progressbar import ETA, Bar, Percentage, ProgressBar
 import math
 
 flags = tf.flags
+tf.logging.set_verbosity(tf.logging.ERROR)
 logging = tf.logging
 
-flags.DEFINE_integer("batch_size", 128, "batch size")
-flags.DEFINE_integer("updates_per_epoch", 10, "number of updates per epoch") #1000
-flags.DEFINE_integer("max_epoch", 100, "max epoch")
+flags.DEFINE_integer("batch_size", 200, "batch size") #128
+flags.DEFINE_integer("updates_per_epoch", 1000, "number of updates per epoch") #1000
+flags.DEFINE_integer("max_epoch", 1000, "max epoch") #100
 flags.DEFINE_float("learning_rate", 1e-2, "learning rate")
 flags.DEFINE_string("working_directory", "", "")
 flags.DEFINE_integer("hidden_size", 10, "size of the hidden VAE unit")
-flags.DEFINE_integer("L", 20, "level of truncation")
+flags.DEFINE_integer("T", 20, "level of truncation")
 flags.DEFINE_float("alpha_0", 1.0, "alpha_0 for the prior Beta distribution")
 flags.DEFINE_float("beta_0", 1.0, "beta_0 for the prior Beta distribution")
 flags.DEFINE_float("sigma2", 1.0, "covariance for the mixtured gaussian components")
 
 FLAGS = flags.FLAGS
-
-@pt.Register(assign_defaults=('activation_fn', 'l2loss',
-                                        'parameter_modifier', 'phase'))
-class transposed_fully_connected(pt.VarStoreMethod):
-
-  def __call__(self,
-               input_layer,
-               in_size,
-               activation_fn=None,
-               l2loss=None,
-               weights=None,
-               bias=tf.zeros_initializer,
-               transpose_weights=False,
-               phase=pt.Phase.train,
-               parameter_modifier=None,
-               name="transposed_fully_connected"):
-    in_size = in_size
-    size = input_layer.shape[0]
-    books = input_layer.bookkeeper
-    if weights is None:
-      weights = layers.he_init(in_size, size, activation_fn)
-
-    dtype = input_layer.tensor.dtype
-    weight_shape = [size, in_size] if transpose_weights else [in_size, size]
-
-    params = self.variable('transposed_fully_connected_weights', weight_shape, weights, dt=dtype)
-    y = tf.matmul(params, input_layer, transpose_b=transpose_weights)
-    layers.add_l2loss(books, params, l2loss)
-    if bias is not None:
-      y += self.variable('transposed_fully_connected_bias', [input_layer.shape[1]], bias, dt=dtype)
-
-    if activation_fn is not None:
-      if not isinstance(activation_fn, collections.Sequence):
-        activation_fn = (activation_fn,)
-      y = layers.apply_activation(books,
-                                  y,
-                                  activation_fn[0],
-                                  activation_args=activation_fn[1:])
-    books.add_histogram_summary(y, '%s/activations' % y.op.name)
-    return input_layer.with_tensor(y, parameters=self.vars)
-
 
 def encoder(input_tensor):
     '''Create encoder network.
@@ -95,7 +55,7 @@ def encoder(input_tensor):
     x_attributes = (mid_features.fully_connected(FLAGS.hidden_size * 2, activation_fn=None)).tensor
     clusters_attributes = (mid_features.
             fully_connected(FLAGS.hidden_size * 2 + 2).
-            transposed_fully_connected(in_size = FLAGS.L, activation_fn=None)).tensor
+            transposed_fully_connected(in_size = FLAGS.T, activation_fn=None)).tensor
 
     mean_eta = clusters_attributes[:, :FLAGS.hidden_size]
     logcov_eta = clusters_attributes[:, FLAGS.hidden_size:FLAGS.hidden_size*2]
@@ -158,17 +118,20 @@ def kl_Beta(alpha, beta, alpha_0, beta_0):
                 - (alpha + beta - alpha_0 - beta_0) * tf.digamma(alpha + beta)
         )
 
-def get_S_loss(alpha, beta, mean_x, logcov_x, mean_eta, logcov_eta, sigma2):
+def get_S_loss(alpha, beta, mean_x, logcov_x, mean_eta, logcov_eta, sigma2, epsilon=1e-8):
     mean_x_pad = tf.expand_dims(mean_x, 1)
     logcov_x_pad = tf.expand_dims(logcov_x, 1)
     mean_eta_pad = tf.expand_dims(mean_eta, 0)
     logcov_eta_pad = tf.expand_dims(logcov_eta, 0)
-    S1 = 0.5 * tf.reduce_sum(1 + logcov_x_pad - math.log(sigma2) - \
-        (tf.exp(logcov_x_pad) + tf.exp(logcov_eta_pad) + tf.square(mean_x_pad - mean_eta_pad)) / sigma2 , 2)
-    S2 = tf.digamma(alpha) - tf.digamma(alpha + beta) + tf.cumsum(tf.digamma(beta) - tf.digamma(alpha + beta), exclusive=True)
-    S = S1 + S2
-    assignments = tf.argmax(S)
-    S_loss = -tf.reduce_sum(tf.log(tf.reduce_sum(tf.exp(S), axis = 1)))
+    S = 0.5 * tf.reduce_sum( \
+            1 + logcov_x_pad - math.log(sigma2) \
+            - (tf.exp(logcov_x_pad) + tf.exp(logcov_eta_pad) + tf.square(mean_x_pad - mean_eta_pad)) / sigma2 , 2 \
+        ) \
+        + tf.digamma(alpha) - tf.digamma(alpha + beta) + tf.cumsum(tf.digamma(beta) - tf.digamma(alpha + beta), exclusive=True)
+
+    assignments = tf.argmax(S, axis=1)
+    S_max = tf.reduce_max(S, axis=1)
+    S_loss = -tf.reduce_sum(S_max) - tf.reduce_sum(tf.log(tf.reduce_sum(tf.exp(S - tf.expand_dims(S_max, 1)), axis = 1) + epsilon))
     return assignments, S_loss
 
 def get_reconstruction_cost(output_tensor, target_tensor, epsilon=1e-8):
@@ -193,7 +156,6 @@ if __name__ == "__main__":
     labels = np.concatenate((mnist.validation.labels, mnist.train.labels, mnist.test.labels))
     mnist_full = make_dataset(images, labels)
     N = mnist_full.num_examples
-    print(N)
 
     input_tensor = tf.placeholder(tf.float32, [FLAGS.batch_size, 28 * 28])
 
@@ -221,17 +183,25 @@ if __name__ == "__main__":
     #loss = rec_loss + kl_Gaussian(mean_x, logcov_x)
 
     optimizer = tf.train.AdamOptimizer(FLAGS.learning_rate, epsilon=1.0)
-    train = pt.apply_optimizer(optimizer, losses=[loss])
-
+    grads_and_vars = optimizer.compute_gradients(loss)
+    clipped_grads_and_vars = []
+    for grad, var in grads_and_vars:
+        if grad is not None:
+            clipped_grads_and_vars.append((tf.clip_by_value(grad, -1., 1.), var))
+        print(grad, var)
+    train = optimizer.apply_gradients(clipped_grads_and_vars)
+    #train = pt.apply_optimizer(optimizer, losses=[loss])
     init = tf.initialize_all_variables()
-    for var in tf.trainable_variables():
-        print(var.name)
-
+    
     with tf.Session() as sess:
         sess.run(init)
 
         for epoch in range(FLAGS.max_epoch):
             training_loss = 0.0
+            loss1 = 0.0
+            loss2 = 0.0
+            loss3 = 0.0
+            loss4 = 0.0
 
             widgets = ["epoch #%d|" % epoch, Percentage(), Bar(), ETA()]
             pbar = ProgressBar(maxval = FLAGS.updates_per_epoch, widgets=widgets)
@@ -239,14 +209,30 @@ if __name__ == "__main__":
             for i in range(FLAGS.updates_per_epoch):
                 pbar.update(i)
                 x, _ = mnist_full.next_batch(FLAGS.batch_size)
-                _, loss_value, loss1, loss2, loss3 = sess.run([train, loss, kl_eta, kl_alphabeta, rec_loss], {input_tensor: x})
+                _, loss_value, loss1_, loss2_, loss3_, loss4_ = sess.run([train, loss, kl_alphabeta, kl_eta, S_loss, rec_loss], {input_tensor: x})
                 training_loss += loss_value
+                loss1 += loss1_
+                loss2 += loss2_
+                loss3 += loss3_
+                loss4 += loss4_
 
-            training_loss = training_loss / \
-                (FLAGS.updates_per_epoch * FLAGS.batch_size)
+            training_loss = training_loss / FLAGS.updates_per_epoch / FLAGS.batch_size
+            loss1 = loss1 / FLAGS.updates_per_epoch / float(N)
+            loss2 = loss2 / FLAGS.updates_per_epoch / float(N)
+            loss3 = loss3 / FLAGS.updates_per_epoch / FLAGS.batch_size
+            loss4 = loss4 / FLAGS.updates_per_epoch / FLAGS.batch_size
 
-            print(loss1, loss2, loss3)
-            print("Loss %f  " % training_loss)
+            mnist_full._index_in_epoch = 0
+            num_batches = int(N / FLAGS.batch_size)
+            labels_pred = np.zeros(num_batches * FLAGS.batch_size)
+            labels = np.zeros(num_batches * FLAGS.batch_size)
+            for i in range(num_batches):
+                x, y = mnist_full.next_batch(FLAGS.batch_size)
+                y_p = sess.run(assignments, {input_tensor: x})
+                labels[i * FLAGS.batch_size : (i + 1) * FLAGS.batch_size] = y
+                labels_pred[i * FLAGS.batch_size : (i + 1) * FLAGS.batch_size] = y_p
+            print("Loss: %f, kl_alphabeta: %f, kl_eta: %f, S_loss: %f, rec_loss: %f, acc: %f, nmi: %f" 
+                % (training_loss, loss1, loss2, loss3, loss4, cluster_acc(labels_pred, labels), cluster_nmi(labels_pred, labels)))
 
             imgs = sess.run(sampled_tensor)
             for k in range(FLAGS.batch_size):
