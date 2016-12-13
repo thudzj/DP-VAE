@@ -29,12 +29,12 @@ flags.DEFINE_integer("max_epoch", 1000, "max epoch") #100
 flags.DEFINE_float("learning_rate", 1e-2, "learning rate")
 flags.DEFINE_string("working_directory", "", "")
 flags.DEFINE_integer("hidden_size", 10, "size of the hidden VAE unit")
-flags.DEFINE_integer("T", 20, "level of truncation")
+flags.DEFINE_integer("T", 10, "level of truncation")
 flags.DEFINE_float("alpha_0", 1.0, "alpha_0 for the prior Beta distribution")
 flags.DEFINE_float("beta_0", 1.0, "beta_0 for the prior Beta distribution")
 flags.DEFINE_float("sigma2", 1.0, "covariance for the mixtured gaussian components")
-
 FLAGS = flags.FLAGS
+print(FLAGS.sigma2)
 
 def encoder(input_tensor):
     '''Create encoder network.
@@ -53,18 +53,42 @@ def encoder(input_tensor):
             dropout(0.9).
             flatten())
     x_attributes = (mid_features.fully_connected(FLAGS.hidden_size * 2, activation_fn=None)).tensor
+    mean_x = x_attributes[:, :FLAGS.hidden_size]
+    logcov_x = x_attributes[:, FLAGS.hidden_size:]
+
+    # eta_attributes = (pt.wrap(mean_x).
+    #         transposed_fully_connected(in_size = 100).
+    #         transposed_fully_connected(in_size = FLAGS.T * 2, activation_fn=None)).tensor
+    # mean_eta = eta_attributes[:FLAGS.T, :]
+    # logcov_eta = eta_attributes[FLAGS.T : FLAGS.T * 2, :]
+
+    # # alphabeta = (pt.wrap(tf.nn.sigmoid(tf.matmul(mean_eta, mean_x, transpose_b=True))).
+    # #         fully_connected(2, activation_fn=None)).tensor
+
+
+    # clusters_attributes = (pt.wrap(mean_x).
+    #         fully_connected(FLAGS.hidden_size * 2 + 2).
+    #         transposed_fully_connected(in_size = FLAGS.T, activation_fn=None)).tensor
+
     clusters_attributes = (mid_features.
-            fully_connected(FLAGS.hidden_size * 2 + 2).
-            transposed_fully_connected(in_size = FLAGS.T, activation_fn=None)).tensor
+            transposed_fully_connected(in_size = FLAGS.T).
+            fully_connected(FLAGS.hidden_size * 2 + 2, activation_fn=None)).tensor
+
+    # clusters_attributes = (mid_features.
+    #         #fully_connected(256).
+    #         #fully_connected(64).
+    #         fully_connected(FLAGS.hidden_size * 2 + 2).
+    #         transposed_fully_connected(in_size = FLAGS.T, activation_fn=None)).tensor
 
     mean_eta = clusters_attributes[:, :FLAGS.hidden_size]
     logcov_eta = clusters_attributes[:, FLAGS.hidden_size:FLAGS.hidden_size*2]
-    alpha = tf.squeeze(tf.exp(clusters_attributes[:, FLAGS.hidden_size*2]))
-    beta = tf.squeeze(tf.exp(clusters_attributes[:, FLAGS.hidden_size*2 + 1]))
-    return x_attributes, mean_eta, logcov_eta, alpha, beta
+    alpha = tf.squeeze(tf.exp(clusters_attributes[:-1, FLAGS.hidden_size*2]))
+    beta = tf.squeeze(tf.exp(clusters_attributes[:-1, FLAGS.hidden_size*2 + 1]))
+
+    return mean_x, logcov_x, mean_eta, logcov_eta, alpha, beta
 
 
-def decoder(input_tensor=None):
+def decoder(mean=None, logcov = None):
     '''Create decoder network.
 
         If input tensor is provided then decodes it, otherwise samples from 
@@ -76,14 +100,12 @@ def decoder(input_tensor=None):
         A tensor that expresses the decoder network
     '''
     epsilon = tf.random_normal([FLAGS.batch_size, FLAGS.hidden_size])
-    if input_tensor is None:
+    if mean is None and logcov is None:
         mean = None
         logcov = None
         stddev = None
         input_sample = epsilon
     else:
-        mean = input_tensor[:, :FLAGS.hidden_size]
-        logcov = input_tensor[:, FLAGS.hidden_size:]
         stddev = tf.sqrt(tf.exp(logcov))
         input_sample = mean + epsilon * stddev
     return (pt.wrap(input_sample).
@@ -97,7 +119,7 @@ def decoder(input_tensor=None):
             # fully_connected(500, name='decoder_l2', activation_fn=tf.nn.relu).
             # fully_connected(500, name='decoder_l3', activation_fn=tf.nn.relu).
             # fully_connected(784, name='decoder_l4', activation_fn=tf.nn.sigmoid)
-            ).tensor, mean, logcov
+            ).tensor
 
 
 def kl_Gaussian(mean, logcov, epsilon=1e-8):
@@ -106,7 +128,7 @@ def kl_Gaussian(mean, logcov, epsilon=1e-8):
 
     Args:
         mean: 
-        stddev:
+        logcov:
         epsilon:
     '''
     return tf.reduce_sum(0.5 * (tf.square(mean) + tf.exp(logcov) - logcov - 1.0))
@@ -123,15 +145,17 @@ def get_S_loss(alpha, beta, mean_x, logcov_x, mean_eta, logcov_eta, sigma2, epsi
     logcov_x_pad = tf.expand_dims(logcov_x, 1)
     mean_eta_pad = tf.expand_dims(mean_eta, 0)
     logcov_eta_pad = tf.expand_dims(logcov_eta, 0)
+    S1 = tf.digamma(alpha) - tf.digamma(alpha + beta)
+    S2 = tf.cumsum(tf.digamma(beta) - tf.digamma(alpha + beta))
     S = 0.5 * tf.reduce_sum( \
             1 + logcov_x_pad - math.log(sigma2) \
             - (tf.exp(logcov_x_pad) + tf.exp(logcov_eta_pad) + tf.square(mean_x_pad - mean_eta_pad)) / sigma2 , 2 \
         ) \
-        + tf.digamma(alpha) - tf.digamma(alpha + beta) + tf.cumsum(tf.digamma(beta) - tf.digamma(alpha + beta), exclusive=True)
+        + tf.concat(0, [S1, tf.constant([0.0])]) + tf.concat(0, [tf.constant([0.0]), S2])
 
-    assignments = tf.argmax(S, axis=1)
-    S_max = tf.reduce_max(S, axis=1)
-    S_loss = -tf.reduce_sum(S_max) - tf.reduce_sum(tf.log(tf.reduce_sum(tf.exp(S - tf.expand_dims(S_max, 1)), axis = 1) + epsilon))
+    assignments = tf.argmax(S, dimension=1)
+    S_max = tf.reduce_max(S, reduction_indices=1)
+    S_loss = -tf.reduce_sum(S_max) - tf.reduce_sum(tf.log(tf.reduce_sum(tf.exp(S - tf.expand_dims(S_max, 1)), reduction_indices = 1) + epsilon))
     return assignments, S_loss
 
 def get_reconstruction_cost(output_tensor, target_tensor, epsilon=1e-8):
@@ -166,13 +190,13 @@ if __name__ == "__main__":
                            scale_after_normalization=True):
         with pt.defaults_scope(phase=pt.Phase.train):
             with tf.variable_scope("encoder") as scope:
-                x_attributes, mean_eta, logcov_eta, alpha, beta = encoder(input_tensor)
+                mean_x, logcov_x, mean_eta, logcov_eta, alpha, beta = encoder(input_tensor)
             with tf.variable_scope("decoder") as scope:
-                output_tensor, mean_x, logcov_x = decoder(x_attributes)
+                output_tensor = decoder(mean_x, logcov_x)
 
         with pt.defaults_scope(phase=pt.Phase.test):
             with tf.variable_scope("decoder", reuse=True) as scope:
-                sampled_tensor, _, _ = decoder()
+                sampled_tensor = decoder()
 
     kl_eta = kl_Gaussian(mean_eta, logcov_eta)
     kl_alphabeta = kl_Beta(alpha, beta, FLAGS.alpha_0, FLAGS.beta_0)
@@ -188,7 +212,7 @@ if __name__ == "__main__":
     for grad, var in grads_and_vars:
         if grad is not None:
             clipped_grads_and_vars.append((tf.clip_by_value(grad, -1., 1.), var))
-        print(grad, var)
+        #print(grad, var)
     train = optimizer.apply_gradients(clipped_grads_and_vars)
     #train = pt.apply_optimizer(optimizer, losses=[loss])
     init = tf.initialize_all_variables()

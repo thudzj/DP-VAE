@@ -1,4 +1,4 @@
 *.pyc
-util/*.pyc
+/util/*.pyc
 /imgs
 /MNIST

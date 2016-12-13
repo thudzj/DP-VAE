@@ -31,7 +31,7 @@ class transposed_fully_connected(pt.VarStoreMethod):
     y = tf.matmul(params, input_layer, transpose_b=transpose_weights)
     layers.add_l2loss(books, params, l2loss)
     if bias is not None:
-      y += self.variable('transposed_fully_connected_bias', [input_layer.shape[1]], bias, dt=dtype)
+      y += self.variable('transposed_fully_connected_bias', [in_size, 1], bias, dt=dtype)
 
     if activation_fn is not None:
       if not isinstance(activation_fn, collections.Sequence):
