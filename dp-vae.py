@@ -26,7 +26,7 @@ logging.set_verbosity(tf.logging.ERROR)
 
 flags.DEFINE_integer("batch_size", 200, "batch size") #128
 flags.DEFINE_integer("updates_per_epoch", 1000, "number of updates per epoch") #1000
-flags.DEFINE_integer("max_epoch", 1000, "max epoch") #100
+flags.DEFINE_integer("max_epoch", 300, "max epoch") #100
 flags.DEFINE_float("learning_rate", 1e-2, "learning rate")
 flags.DEFINE_string("working_directory", "", "")
 flags.DEFINE_integer("hidden_size", 10, "size of the hidden VAE unit")
@@ -34,9 +34,10 @@ flags.DEFINE_integer("T", 10, "level of truncation")
 flags.DEFINE_float("alpha_0", 1.0, "alpha_0 for the prior Beta distribution")
 flags.DEFINE_float("beta_0", 1.0, "beta_0 for the prior Beta distribution")
 flags.DEFINE_float("sigma2", 1.0, "covariance for the mixtured gaussian components")
+flags.DEFINE_integer("rnncell_size", 1000, "the hidden size of rnn cell")
 FLAGS = flags.FLAGS
 
-def encoder(input_tensor):
+def encoder(input_tensor, state_tensor):
     '''Create encoder network.
 
     Args:
@@ -56,33 +57,33 @@ def encoder(input_tensor):
     mean_x = x_attributes[:, :FLAGS.hidden_size]
     logcov_x = x_attributes[:, FLAGS.hidden_size:]
 
-    # eta_attributes = (pt.wrap(mean_x).
-    #         transposed_fully_connected(in_size = 100).
-    #         transposed_fully_connected(in_size = FLAGS.T * 2, activation_fn=None)).tensor
-    # mean_eta = eta_attributes[:FLAGS.T, :]
-    # logcov_eta = eta_attributes[FLAGS.T : FLAGS.T * 2, :]
+    # A = (pt.template('x').gru_cell(num_units=FLAGS.rnncell_size, state=pt.UnboundVariable('state')))
+    # for i in range(FLAGS.batch_size):
+        # if i == 0:
+            # lstm_feature, [new_state] = A.construct(x=tf.expand_dims(mid_features.tensor[i], 0), state=state_tensor)
+        # else:
+            # lstm_feature, [new_state] = A.construct(x=tf.expand_dims(mid_features.tensor[i], 0), state=new_state)
+    # clusters_attributes = (pt.wrap(lstm_feature).fully_connected(FLAGS.T*(2*FLAGS.hidden_size+2)-2, activation_fn=None)).tensor
 
-    # # alphabeta = (pt.wrap(tf.nn.sigmoid(tf.matmul(mean_eta, mean_x, transpose_b=True))).
-    # #         fully_connected(2, activation_fn=None)).tensor
+    lstm_features, [new_state] = mid_features.gru_cell(num_units=FLAGS.rnncell_size, state=state_tensor)
+    clusters_attributes = (pt.wrap(tf.reduce_mean(lstm_features, 0, keep_dims=True)).fully_connected(FLAGS.T*(2*FLAGS.hidden_size+2)-2, activation_fn=None)).tensor
 
+    mean_eta = tf.reshape(clusters_attributes[:, :FLAGS.T*FLAGS.hidden_size], [FLAGS.T, FLAGS.hidden_size])
+    logcov_eta = tf.reshape(clusters_attributes[:, FLAGS.T*FLAGS.hidden_size: 2*FLAGS.T*FLAGS.hidden_size], [FLAGS.T, FLAGS.hidden_size])
+    alpha = tf.exp(tf.squeeze(clusters_attributes[:, 2*FLAGS.T*FLAGS.hidden_size:2*FLAGS.T*FLAGS.hidden_size+FLAGS.T-1]))
+    beta = tf.exp(tf.squeeze(clusters_attributes[:, 2*FLAGS.T*FLAGS.hidden_size+FLAGS.T-1:]))
 
-    # clusters_attributes = (mid_features.
-    #         transposed_fully_connected(in_size = FLAGS.batch_size).
-    #         transposed_fully_connected(in_size = FLAGS.T).
-    #         fully_connected(FLAGS.hidden_size * 2 + 2, activation_fn=None)).tensor
+    # list_attributes = []
+    # for i in range(FLAGS.T):
+    #     list_attributes.append(tf.reduce_mean((mid_features.fully_connected(FLAGS.hidden_size * 2 + 2, activation_fn=None)).tensor, 0))
+    # clusters_attributes = tf.pack(list_attributes)
 
+    # mean_eta = clusters_attributes[:, :FLAGS.hidden_size]
+    # logcov_eta = clusters_attributes[:, FLAGS.hidden_size:FLAGS.hidden_size*2]
+    # alpha = tf.squeeze(tf.exp(clusters_attributes[:-1, FLAGS.hidden_size*2]))
+    # beta = tf.squeeze(tf.exp(clusters_attributes[:-1, FLAGS.hidden_size*2 + 1]))
 
-    list_attributes = []
-    for i in range(FLAGS.T):
-        list_attributes.append(tf.reduce_mean((mid_features.fully_connected(FLAGS.hidden_size * 2 + 2, activation_fn=None)).tensor, 0))
-    clusters_attributes = tf.pack(list_attributes)
-
-    mean_eta = clusters_attributes[:, :FLAGS.hidden_size]
-    logcov_eta = clusters_attributes[:, FLAGS.hidden_size:FLAGS.hidden_size*2]
-    alpha = tf.squeeze(tf.exp(clusters_attributes[:-1, FLAGS.hidden_size*2]))
-    beta = tf.squeeze(tf.exp(clusters_attributes[:-1, FLAGS.hidden_size*2 + 1]))
-
-    return mean_x, logcov_x, mean_eta, logcov_eta, alpha, beta
+    return mean_x, logcov_x, mean_eta, logcov_eta, alpha, beta, new_state
 
 
 def decoder(mean=None, logcov = None):
@@ -173,7 +174,7 @@ def get_regularization(mean_eta, logcov_eta):
     #reg = -tf.reduce_sum(tf.square(tf.reduce_mean(mean_eta, 0) - mean_eta))
     # cov_eta = tf.exp(logcov_eta)
     # reg += tf.reduce_sum(tf.sqrt(tf.reduce_sum(tf.square(tf.reduce_mean(cov_eta, 0) - cov_eta), 1)))
-    return reg * 1e-6
+    return reg*1e-6
 
 if __name__ == "__main__":
     data_directory = os.path.join(FLAGS.working_directory, "MNIST")
@@ -186,6 +187,7 @@ if __name__ == "__main__":
     N = mnist_full.num_examples
 
     input_tensor = tf.placeholder(tf.float32, [FLAGS.batch_size, 28 * 28])
+    state_tensor = tf.placeholder(tf.float32, [FLAGS.batch_size, FLAGS.rnncell_size])
     #mean_eta_tensor = tf.placeholder(tf.float32, [FLAGS.T, FLAGS.hidden_size])
 
     with pt.defaults_scope(activation_fn=tf.nn.elu,
@@ -195,7 +197,7 @@ if __name__ == "__main__":
                            scale_after_normalization=True):
         with pt.defaults_scope(phase=pt.Phase.train):
             with tf.variable_scope("encoder") as scope:
-                mean_x, logcov_x, mean_eta, logcov_eta, alpha, beta = encoder(input_tensor)
+                mean_x, logcov_x, mean_eta, logcov_eta, alpha, beta, new_state = encoder(input_tensor, state_tensor)
             with tf.variable_scope("decoder") as scope:
                 output_tensor = decoder(mean_x, logcov_x)
 
@@ -210,6 +212,7 @@ if __name__ == "__main__":
     reg = get_regularization(mean_eta, logcov_eta)
 
     loss = (kl_eta + kl_alphabeta) / float(N) * float(FLAGS.batch_size) + rec_loss + S_loss + reg
+    vae_loss = rec_loss + kl_Gaussian(mean_x, logcov_x)
     #loss =  rec_loss + S_loss + reg
 
     optimizer = tf.train.AdamOptimizer(FLAGS.learning_rate, epsilon=1.0)
@@ -220,12 +223,32 @@ if __name__ == "__main__":
             clipped_grads_and_vars.append((tf.clip_by_value(grad, -1., 1.), var))
         #print(grad, var)
     train = optimizer.apply_gradients(clipped_grads_and_vars)
-    #train = pt.apply_optimizer(optimizer, losses=[loss])
+
+    train_vae = pt.apply_optimizer(optimizer, losses=[vae_loss])
     init = tf.initialize_all_variables()
     
     with tf.Session() as sess:
         sess.run(init)
+        FLAGS.updates_per_epoch = int(N / FLAGS.batch_size)
+        print("Pre-training the vae model")
         #gmm = GaussianMixture(n_components = FLAGS.T, covariance_type="diag", warm_start=True)
+        for epoch in range(0):
+            training_loss = 0.0
+            widgets = ["epoch #%d|" % epoch, Percentage(), Bar(), ETA()]
+            pbar = ProgressBar(maxval = FLAGS.updates_per_epoch, widgets=widgets)
+            pbar.start()
+            for i in range(FLAGS.updates_per_epoch):
+                pbar.update(i)
+                x, _ = mnist_full.next_batch(FLAGS.batch_size)
+                _, loss_value = sess.run([train_vae, vae_loss], {input_tensor: x})
+                training_loss += loss_value
+
+            training_loss = training_loss / \
+                (FLAGS.updates_per_epoch * FLAGS.batch_size)
+
+            print("Loss %f" % training_loss)
+
+        print("Training the dp-vae model")
         for epoch in range(FLAGS.max_epoch):
             training_loss = 0.0
             loss1 = 0.0
@@ -233,6 +256,9 @@ if __name__ == "__main__":
             loss3 = 0.0
             loss4 = 0.0
             loss5 = 0.0
+            cur_state = np.zeros((FLAGS.batch_size, FLAGS.rnncell_size))
+            labels_pred = np.zeros(N)
+            labels = np.zeros(N)
 
             widgets = ["epoch #%d|" % epoch, Percentage(), Bar(), ETA()]
             pbar = ProgressBar(maxval = FLAGS.updates_per_epoch, widgets=widgets)
@@ -240,11 +266,14 @@ if __name__ == "__main__":
             
             for i in range(FLAGS.updates_per_epoch):
                 pbar.update(i)
-                x, _ = mnist_full.next_batch(FLAGS.batch_size)
+                x, y = mnist_full.next_batch(FLAGS.batch_size)
                 # [m_x] = sess.run([mean_x], {input_tensor: x})
                 # g_means = gmm.fit(m_x).means_
-                _, loss_value, loss1_, loss2_, loss3_, loss4_, loss5_ = sess.run([train, loss, kl_alphabeta, kl_eta, S_loss, rec_loss, reg], {input_tensor: x})
+
+                _, cur_state, y_p, loss_value, loss1_, loss2_, loss3_, loss4_, loss5_ = sess.run([train, new_state, assignments, loss, kl_alphabeta, kl_eta, S_loss, rec_loss, reg], {input_tensor: x, state_tensor:cur_state})
                 #print(loss1_, loss2_, loss3_, loss4_, loss5_)
+                labels[i * FLAGS.batch_size : (i + 1) * FLAGS.batch_size] = y
+                labels_pred[i * FLAGS.batch_size : (i + 1) * FLAGS.batch_size] = y_p
                 training_loss += loss_value
                 loss1 += loss1_
                 loss2 += loss2_
@@ -258,24 +287,15 @@ if __name__ == "__main__":
             loss3 = loss3 / FLAGS.updates_per_epoch / FLAGS.batch_size
             loss4 = loss4 / FLAGS.updates_per_epoch / FLAGS.batch_size
             loss5 = loss5 / FLAGS.updates_per_epoch / FLAGS.batch_size
-
-            mnist_full._index_in_epoch = 0
-            num_batches = int(N / FLAGS.batch_size)
-            labels_pred = np.zeros(num_batches * FLAGS.batch_size)
-            labels = np.zeros(num_batches * FLAGS.batch_size)
-            for i in range(num_batches):
-                x, y = mnist_full.next_batch(FLAGS.batch_size)
-                y_p = sess.run(assignments, {input_tensor: x})
-                labels[i * FLAGS.batch_size : (i + 1) * FLAGS.batch_size] = y
-                labels_pred[i * FLAGS.batch_size : (i + 1) * FLAGS.batch_size] = y_p
+                
             print("Loss: %f, kl_alphabeta: %f, kl_eta: %f, S_loss: %f, rec_loss: %f, reg: %f, acc: %f, nmi: %f" 
                 % (training_loss, loss1, loss2, loss3, loss4, loss5, cluster_acc(labels_pred, labels), cluster_nmi(labels_pred, labels)))
 
-            imgs = sess.run(sampled_tensor)
-            for k in range(FLAGS.batch_size):
-                imgs_folder = os.path.join(FLAGS.working_directory, 'imgs')
-                if not os.path.exists(imgs_folder):
-                    os.makedirs(imgs_folder)
+            # imgs = sess.run(sampled_tensor)
+            # for k in range(FLAGS.batch_size):
+            #     imgs_folder = os.path.join(FLAGS.working_directory, 'imgs')
+            #     if not os.path.exists(imgs_folder):
+            #         os.makedirs(imgs_folder)
 
-                imsave(os.path.join(imgs_folder, '%d.png') % k,
-                       imgs[k].reshape(28, 28))
+            #     imsave(os.path.join(imgs_folder, '%d.png') % k,
+            #            imgs[k].reshape(28, 28))
