@@ -25,16 +25,17 @@ logging = tf.logging
 logging.set_verbosity(tf.logging.ERROR)
 
 flags.DEFINE_integer("batch_size", 350, "batch size") #128
-flags.DEFINE_integer("updates_per_epoch", 1000, "number of updates per epoch") #1000
+flags.DEFINE_integer("updates_per_epoch", 600, "number of updates per epoch") #1000
 flags.DEFINE_integer("max_epoch", 300, "max epoch") #100
 flags.DEFINE_float("learning_rate", 1e-2, "learning rate")
 flags.DEFINE_string("working_directory", "", "")
 flags.DEFINE_integer("hidden_size", 10, "size of the hidden VAE unit")
 flags.DEFINE_integer("T", 10, "level of truncation")
+flags.DEFINE_float("lam", 1.0, "weight of the regularizer")
 FLAGS = flags.FLAGS
 
 def encoder(input_tensor):
-    '''Create encoder network.
+    '''Create encoder network. 32 64 128
 
     Args:
         input_tensor: a batch of flattened images [batch_size, 28*28]
@@ -45,8 +46,8 @@ def encoder(input_tensor):
     mid_features = (pt.wrap(input_tensor).
             reshape([FLAGS.batch_size, 28, 28, 1]).
             conv2d(5, 32, stride=2).
-            conv2d(5, 64, stride=2).
-            conv2d(5, 128, edges='VALID').
+            conv2d(5, 128, stride=2).
+            conv2d(5, 256, edges='VALID').
             dropout(0.9).
             flatten())
     x_attributes = (mid_features.fully_connected(FLAGS.hidden_size * 2, activation_fn=None)).tensor
@@ -78,8 +79,8 @@ def decoder(mean=None, logcov = None):
         input_sample = mean + epsilon * stddev
     return (pt.wrap(input_sample).
             reshape([FLAGS.batch_size, 1, 1, FLAGS.hidden_size]).
-            deconv2d(3, 128, edges='VALID').
-            deconv2d(5, 64, edges='VALID').
+            deconv2d(3, 256, edges='VALID').
+            deconv2d(5, 128, edges='VALID').
             deconv2d(5, 32, stride=2).
             deconv2d(5, 1, stride=2, activation_fn=tf.nn.sigmoid).
             flatten()
@@ -108,16 +109,20 @@ def kl_Gaussian(mean_x, logcov_x, mu_tensor, pre_tensor, epsilon=1e-8):
     logcov_x_pad = tf.expand_dims(logcov_x, 1)
     pre_tensor_pad = tf.expand_dims(pre_tensor, 0)
     return 0.5 * tf.reduce_sum((pre_tensor_pad*tf.exp(logcov_x_pad) + pre_tensor_pad * tf.square(mean_x_pad-mu_tensor_pad) 
-        - FLAGS.hidden_size - tf.log(pre_tensor_pad) - logcov_x_pad), 2)
+        - 1 - tf.log(pre_tensor_pad) - logcov_x_pad), 2)
 
+def get_regularizer(S):
+    return tf.reduce_sum(tf.nn.softmax(S) * tf.nn.log_softmax(S))
 
 def get_S_loss(mean_x, logcov_x, pi_tensor, mu_tensor, pre_tensor, epsilon=1e-8):
     S = -kl_Gaussian(mean_x, logcov_x, mu_tensor, pre_tensor) + tf.log(pi_tensor + epsilon)
-
+    reg = get_regularizer(S) * FLAGS.lam
+ 
     assignments = tf.argmax(S, dimension=1)
     S_max = tf.reduce_max(S, reduction_indices=1)
     S_loss = -tf.reduce_sum(S_max) - tf.reduce_sum(tf.log(tf.reduce_sum(tf.exp(S - tf.expand_dims(S_max, 1)), reduction_indices = 1) + epsilon))
-    return assignments, S_loss
+    #S_loss = - tf.reduce_sum(tf.log(tf.reduce_sum(tf.exp(S), reduction_indices = 1) + epsilon))
+    return assignments, S_loss, reg
 
 
 if __name__ == "__main__":
@@ -153,7 +158,7 @@ if __name__ == "__main__":
             with tf.variable_scope("decoder", reuse=True) as scope:
                 sampled_tensor = decoder()
 
-    assignments, S_loss = get_S_loss(mean_x, logcov_x, pi_tensor, mu_tensor, pre_tensor)
+    assignments, S_loss, reg = get_S_loss(mean_x, logcov_x, pi_tensor, mu_tensor, pre_tensor)
     rec_loss = get_reconstruction_cost(output_tensor, input_tensor)
 
     loss = rec_loss + S_loss
@@ -163,12 +168,13 @@ if __name__ == "__main__":
     # grads_and_vars = optimizer.compute_gradients(loss)
     # clipped_grads_and_vars = []
     # for grad, var in grads_and_vars:
-    #     if grad is not None:
-    #         clipped_grads_and_vars.append((tf.clip_by_value(grad, -1., 1.), var))
-    #     #print(grad, var)
+        # if grad is not None:
+            # clipped_grads_and_vars.append((tf.clip_by_value(grad, -1., 1.), var))
+        # #print(grad, var)
     # train = optimizer.apply_gradients(clipped_grads_and_vars)
 
     train = pt.apply_optimizer(optimizer, losses=[loss])
+    train_reg = pt.apply_optimizer(optimizer, losses=[loss + reg])
     train_vae = pt.apply_optimizer(optimizer, losses=[vae_loss])
     init = tf.initialize_all_variables()
     
@@ -198,6 +204,7 @@ if __name__ == "__main__":
             training_loss = 0.0
             loss1 = 0.0
             loss2 = 0.0
+            loss3 = 0.0
 
             widgets = ["epoch #%d|" % epoch, Percentage(), Bar(), ETA()]
             pbar = ProgressBar(maxval = FLAGS.updates_per_epoch, widgets=widgets)
@@ -206,18 +213,24 @@ if __name__ == "__main__":
             for i in range(FLAGS.updates_per_epoch):
                 pbar.update(i)
                 x, y = mnist_full.next_batch(FLAGS.batch_size)
-                _, y_p, loss_value, loss1_, loss2_ = sess.run([train, assignments, loss, S_loss, rec_loss], 
+                if epoch < 1000:
+                  _, y_p, loss_value, loss1_, loss2_, loss3_ = sess.run([train, assignments, loss, S_loss, rec_loss, reg],
+                    {input_tensor: x, mu_tensor: mus, pi_tensor: pis, pre_tensor: precisions})                  
+                else:
+                  _, y_p, loss_value, loss1_, loss2_, loss3_ = sess.run([train_reg, assignments, loss, S_loss, rec_loss, reg], 
                     {input_tensor: x, mu_tensor: mus, pi_tensor: pis, pre_tensor: precisions})
                 training_loss += loss_value
                 loss1 += loss1_
                 loss2 += loss2_
+                loss3 += loss3_
 
             training_loss = training_loss / FLAGS.updates_per_epoch / FLAGS.batch_size
             loss1 = loss1 / FLAGS.updates_per_epoch / FLAGS.batch_size
             loss2 = loss2 / FLAGS.updates_per_epoch / FLAGS.batch_size
+            loss3 = loss3 / FLAGS.updates_per_epoch / FLAGS.batch_size
                 
-            print("Loss: %f, S_loss: %f, rec_loss: %f" 
-                % (training_loss, loss1, loss2))
+            print("Loss: %f, S_loss: %f, rec_loss: %f, reg: %f" 
+                % (training_loss, loss1, loss2, loss3))
 
             all_batches = int(N / FLAGS.batch_size)
             features = np.zeros((N, FLAGS.hidden_size))
@@ -228,14 +241,15 @@ if __name__ == "__main__":
                 [xx] = sess.run([mean_x], {input_tensor: x})
                 features[i * FLAGS.batch_size: (i + 1) * FLAGS.batch_size, :] = xx
                 labels[i * FLAGS.batch_size: (i + 1) * FLAGS.batch_size] = y
-            model = BayesianGaussianMixture(n_components = FLAGS.T, max_iter = 300, covariance_type = 'diag')
+            model = BayesianGaussianMixture(n_components = FLAGS.T, max_iter = 300, covariance_type = 'diag', weight_concentration_prior=2)
             model.fit(features)
             preds = model.predict(features)
             pis = model.weights_
             mus = model.means_
             precisions = model.precisions_
 
-            print("acc: %f, nmi: %f" % (cluster_acc(preds, labels), cluster_nmi(preds, labels)))
+            print("------------> acc: %f, nmi: %f" % (cluster_acc(preds, labels), cluster_nmi(preds, labels)))
+            # print(pis)
             # imgs = sess.run(sampled_tensor)
             # for k in range(FLAGS.batch_size):
             #     imgs_folder = os.path.join(FLAGS.working_directory, 'imgs')
