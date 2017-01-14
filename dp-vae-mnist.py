@@ -34,6 +34,7 @@ flags.DEFINE_integer("T", 10, "level of truncation")
 flags.DEFINE_float("lam", 1.0, "weight of the regularizer")
 flags.DEFINE_float("alpha_0", 1.0, "alpha_0 for the prior Beta distribution")
 flags.DEFINE_float("beta_0", 1.0, "beta_0 for the prior Beta distribution")
+flags.DEFINE_integer("s", 100, "number of samples for testing")
 FLAGS = flags.FLAGS
 
 def variable_summaries(var):
@@ -55,20 +56,26 @@ def encoder(input_tensor):
     logcov_x = x_attributes[:, FLAGS.hidden_size:]
     return mean_x, logcov_x
 
-def decoder(mean=None, logcov=None):
-    epsilon = tf.random_normal([FLAGS.batch_size, FLAGS.hidden_size])
+def decoder(mean=None, logcov=None, s=None):
     if mean is None and logcov is None:
+        epsilon = tf.random_normal([FLAGS.batch_size, FLAGS.hidden_size])
         mean = None
         logcov = None
         stddev = None
         input_sample = epsilon
     else:
         stddev = tf.sqrt(tf.exp(logcov))
-        input_sample = mean + epsilon * stddev
+        if s is None:
+            epsilon = tf.random_normal([FLAGS.batch_size, FLAGS.hidden_size])
+            input_sample = mean + epsilon * stddev
+        else:
+            epsilon = tf.random_normal([s, FLAGS.batch_size, FLAGS.hidden_size])
+            input_sample = tf.expand_dims(mean, 0) + epsilon * tf.expand_dims(stddev, 0)
+            input_sample = tf.reshape(input_sample, [-1, FLAGS.hidden_size])
     return (pt.wrap(input_sample).
             fully_connected(500, name='decoder_fc1', activation_fn=tf.nn.tanh).
             fully_connected(784, name='decoder_fc2', activation_fn=tf.nn.sigmoid)
-            ).tensor
+            ).tensor, input_sample
 
 def get_reconstruction_cost(output_tensor, target_tensor, epsilon=1e-8):
     return tf.reduce_sum(-target_tensor * tf.log(output_tensor + epsilon) -
@@ -93,7 +100,7 @@ def get_qeta_reg_loss(mu, sigma):
                 - tf.square(mu - mu_0) / tf.square(sigma_0))
 
 def get_S_loss_hao(mean_x, logcov_x, qv_alpha, qv_beta, qeta_mu, qeta_sigma, epsilon = 1e-8):
-    sigma_px = 1.0  
+    sigma_px = 1.0
     S1 = tf.digamma(qv_alpha) - tf.digamma(qv_alpha + qv_beta) 
     S2 = tf.cumsum(tf.digamma(qv_beta) - tf.digamma(qv_alpha + qv_beta))
 
@@ -113,6 +120,29 @@ def get_S_loss_hao(mean_x, logcov_x, qv_alpha, qv_beta, qeta_mu, qeta_sigma, eps
     # S_loss = -tf.reduce_sum(tf.log(tf.reduce_sum(tf.exp(S), 1)))
     S_loss = -tf.reduce_sum(S_max) - tf.reduce_sum(tf.log(tf.reduce_sum(tf.exp(S - tf.expand_dims(S_max, 1)), 1) + epsilon))
     return S_loss, qz, S
+
+def gaussian_mixture_pdf(mu, sigma, x, pi):
+    mu_expand = tf.reshape(tf.transpose(mu), [FLAGS.T, 1, 1, FLAGS.hidden_size])
+    sigma_expand = tf.reshape(tf.transpose(sigma), [FLAGS.T, 1, 1, FLAGS.hidden_size])
+    return tf.reduce_sum(1 / tf.sqrt(tf.reduce_prod(sigma_expand, 3)) 
+                        * tf.exp(-0.5 * tf.reduce_sum(tf.square(x - mu_expand) / sigma_expand, 3)) * tf.reshape(pi, [-1, 1, 1]), 0)
+
+def get_marginal_likelihood(yt, mean_yt, xt, s, alpha_0, beta_0, alpha, beta, eta_mu, eta_sigma, epsilon = 1e-80):
+    sigma_px = 1.0 
+    mu_0 = tf.zeros([FLAGS.hidden_size, FLAGS.T])  #parameters of p(\eta) ~ N(mu_0, sigma_0^2 I)
+    sigma_0 = 100.0 * tf.ones([FLAGS.hidden_size, FLAGS.T])
+    yt_expand = tf.expand_dims(yt, 0)
+    mean_yt = tf.reshape(mean_yt, [s, FLAGS.batch_size, 784])
+    xt = tf.reshape(xt, [1, s, FLAGS.batch_size, FLAGS.hidden_size])
+    p_ygivenx = tf.reduce_prod(tf.pow(mean_yt, yt_expand) * tf.pow(1 - mean_yt, 1 - yt_expand), axis=2)
+    v_0 = tf.ones([FLAGS.T - 1], tf.float32) * alpha_0 / (alpha_0 + beta_0)
+    pi_0 = tf.concat(0, [v_0, [1.0]]) * tf.concat(0, [[1.0], tf.cumprod(1 - v_0)])
+    v = alpha / (alpha + beta)
+    pi = tf.concat(0, [v, [1.0]]) * tf.concat(0, [[1.0], tf.cumprod(1 - v)])
+    p_x = gaussian_mixture_pdf(mu_0, sigma_0 + sigma_px, xt, pi_0)
+    q_x = gaussian_mixture_pdf(eta_mu, eta_sigma + sigma_px, xt, pi)
+    log_p_y = tf.log(tf.reduce_mean(p_ygivenx * p_x / q_x, 0))
+    return tf.reduce_mean(log_p_y + epsilon)
 
 if __name__ == "__main__":
     data_directory = os.path.join(FLAGS.working_directory, "MNIST")
@@ -137,11 +167,13 @@ if __name__ == "__main__":
             with tf.variable_scope("encoder") as scope:
                 mean_x, logcov_x = encoder(input_tensor)
             with tf.variable_scope("decoder") as scope:
-                output_tensor = decoder(mean_x, logcov_x)
+                output_tensor, _ = decoder(mean_x, logcov_x)
 
         with pt.defaults_scope(phase=pt.Phase.test):
+            with tf.variable_scope("encoder", reuse=True) as scope:
+                mean_xt, logcov_xt = encoder(input_tensor)
             with tf.variable_scope("decoder", reuse=True) as scope:
-                sampled_tensor = decoder()
+                mean_yt, xt = decoder(mean_xt, logcov_xt, FLAGS.s)
 
     ''' edit by hao'''
     # first, get the reconstruction term E_q(X|Y) log p(Y|X)
@@ -164,6 +196,7 @@ if __name__ == "__main__":
     '''END edit by hao'''
 
     overall_loss = qv_reg_loss + qeta_reg_loss + rec_loss + S_loss
+    log_p_yt = get_marginal_likelihood(input_tensor, mean_yt, xt, FLAGS.s, FLAGS.alpha_0, FLAGS.beta_0, qv_alpha, qv_beta, qeta_mu, qeta_sigma)
     # Create optimizers
     encoder_trainables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='encoder')
     decoder_trainables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='decoder')
@@ -222,11 +255,11 @@ if __name__ == "__main__":
             def eval_ELBO(dataset, name):
                 dataset._index_in_epoch = 0
                 num_iter = int(dataset.num_examples / FLAGS.batch_size)
-                overall_loss_total, rec_loss_total, S_loss_total, qeta_reg_loss_total, qv_reg_loss_total = 0.0, 0.0, 0.0, 0.0, 0.0
+                overall_loss_total, rec_loss_total, S_loss_total, qeta_reg_loss_total, qv_reg_loss_total, heldout_ll = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
                 for i in range(num_iter):
                     x, _ = dataset.next_batch(FLAGS.batch_size)
-                    overall_loss_, rec_loss_, S_loss_, qeta_reg_loss_, qv_reg_loss_ \
-										    = sess.run([overall_loss, rec_loss, S_loss, qeta_reg_loss, qv_reg_loss], \
+                    overall_loss_, rec_loss_, S_loss_, qeta_reg_loss_, qv_reg_loss_ , log_p_yt_\
+										    = sess.run([overall_loss, rec_loss, S_loss, qeta_reg_loss, qv_reg_loss, log_p_yt], \
 						    										{input_tensor: x})                  
                     overall_loss_total += overall_loss_ 
                     #print("epoch %d: iter %d, rec_loss: %f, S_loss: %f, qeta_loss: %f, qv_loss: %f" % (epoch, i, rec_loss_, S_loss_, qeta_reg_loss_, qv_reg_loss_))
@@ -234,13 +267,15 @@ if __name__ == "__main__":
                     S_loss_total += S_loss_
                     qeta_reg_loss_total += qeta_reg_loss_
                     qv_reg_loss_total += qv_reg_loss_
+                    heldout_ll += log_p_yt_
                 overall_loss_total = overall_loss_total / num_iter 
                 rec_loss_total = rec_loss_total / num_iter
                 S_loss_total = S_loss_total / num_iter
                 qeta_reg_loss_total = qeta_reg_loss_total / num_iter
                 qv_reg_loss_total = qv_reg_loss_total / num_iter
-                print("%s ELBO: %f, rec_LL: %f, S_LL: %f, qeta_reg_LL: %f, qv_reg_LL: %f..." 
-                    % (name, -overall_loss_total, -rec_loss_total, -S_loss_total, -qeta_reg_loss_total, -qv_reg_loss_total))
+                heldout_ll = heldout_ll / num_iter
+                print("%s ELBO: %f, rec_LL: %f, S_LL: %f, qeta_reg_LL: %f, qv_reg_LL: %f, heldout_nll: %f..." 
+                    % (name, -overall_loss_total, -rec_loss_total, -S_loss_total, -qeta_reg_loss_total, -qv_reg_loss_total, -heldout_ll))
 
             eval_ELBO(mnist_val, 'val')
             eval_ELBO(mnist_test, 'test')
