@@ -91,8 +91,9 @@ def get_marginal_likelihood(yt, mean_yt, xt, s, eps, epsilon = 1e-8):
         + (1.0 - yt_expand) * tf.log(1.0 - mean_yt + epsilon), 2) \
         - 0.5 * tf.reduce_sum(tf.square(xt), 2) \
         + 0.5 * tf.reduce_sum(tf.square(eps), 2)
+    log_p_y_s_max = tf.reduce_max(log_p_y_s, reduction_indices=0)
     
-    log_p_y = tf.log(tf.reduce_mean(tf.exp(log_p_y_s), 0))
+    log_p_y = tf.log(tf.reduce_mean(tf.exp(log_p_y_s - log_p_y_s_max), 0)) + log_p_y_s_max
     return tf.reduce_mean(log_p_y)
 
 if __name__ == "__main__":
