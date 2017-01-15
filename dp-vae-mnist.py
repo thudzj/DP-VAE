@@ -70,12 +70,13 @@ def decoder(mean=None, logcov=None, s=None):
             input_sample = mean + epsilon * stddev
         else:
             epsilon = tf.random_normal([s, FLAGS.batch_size, FLAGS.hidden_size])
+            # q_x = tf.exp(-0.5 * tf.reduce_sum(tf.square(epsilon), 2))
             input_sample = tf.expand_dims(mean, 0) + epsilon * tf.expand_dims(stddev, 0)
             input_sample = tf.reshape(input_sample, [-1, FLAGS.hidden_size])
     return (pt.wrap(input_sample).
             fully_connected(500, name='decoder_fc1', activation_fn=tf.nn.tanh).
             fully_connected(784, name='decoder_fc2', activation_fn=tf.nn.sigmoid)
-            ).tensor, input_sample
+            ).tensor, input_sample, epsilon
 
 def get_reconstruction_cost(output_tensor, target_tensor, epsilon=1e-8):
     return tf.reduce_sum(-target_tensor * tf.log(output_tensor + epsilon) -
@@ -127,22 +128,21 @@ def gaussian_mixture_pdf(mu, sigma, x, pi):
     return tf.reduce_sum(1 / tf.sqrt(tf.reduce_prod(sigma_expand, 3)) 
                         * tf.exp(-0.5 * tf.reduce_sum(tf.square(x - mu_expand) / sigma_expand, 3)) * tf.reshape(pi, [-1, 1, 1]), 0)
 
-def get_marginal_likelihood(yt, mean_yt, xt, s, alpha_0, beta_0, alpha, beta, eta_mu, eta_sigma, epsilon = 1e-80):
+def get_marginal_likelihood(yt, mean_yt, xt, s, alpha, beta, eta_mu, eta_sigma, eps, epsilon = 1e-8):
     sigma_px = 1.0 
-    mu_0 = tf.zeros([FLAGS.hidden_size, FLAGS.T])  #parameters of p(\eta) ~ N(mu_0, sigma_0^2 I)
-    sigma_0 = 100.0 * tf.ones([FLAGS.hidden_size, FLAGS.T])
     yt_expand = tf.expand_dims(yt, 0)
     mean_yt = tf.reshape(mean_yt, [s, FLAGS.batch_size, 784])
     xt = tf.reshape(xt, [1, s, FLAGS.batch_size, FLAGS.hidden_size])
-    p_ygivenx = tf.reduce_prod(tf.pow(mean_yt, yt_expand) * tf.pow(1 - mean_yt, 1 - yt_expand), axis=2)
-    v_0 = tf.ones([FLAGS.T - 1], tf.float32) * alpha_0 / (alpha_0 + beta_0)
-    pi_0 = tf.concat(0, [v_0, [1.0]]) * tf.concat(0, [[1.0], tf.cumprod(1 - v_0)])
+    # p_ygivenx = tf.reduce_prod(tf.pow(mean_yt, yt_expand) * tf.pow(1 - mean_yt, 1 - yt_expand), axis=2)
     v = alpha / (alpha + beta)
     pi = tf.concat(0, [v, [1.0]]) * tf.concat(0, [[1.0], tf.cumprod(1 - v)])
-    p_x = gaussian_mixture_pdf(mu_0, sigma_0 + sigma_px, xt, pi_0)
-    q_x = gaussian_mixture_pdf(eta_mu, eta_sigma + sigma_px, xt, pi)
-    log_p_y = tf.log(tf.reduce_mean(p_ygivenx * p_x / q_x, 0))
-    return tf.reduce_mean(log_p_y + epsilon)
+    p_x = gaussian_mixture_pdf(eta_mu, eta_sigma + sigma_px, xt, pi)
+    log_p_y_s = tf.reduce_sum(yt_expand * tf.log(mean_yt + epsilon) \
+        + (1.0 - yt_expand) * tf.log(1.0 - mean_yt + epsilon), 2) \
+        + tf.log(p_x) \
+        + 0.5 * tf.reduce_sum(tf.square(eps), 2)
+    log_p_y = tf.log(tf.reduce_mean(tf.exp(log_p_y_s), 0))
+    return tf.reduce_mean(log_p_y)
 
 if __name__ == "__main__":
     data_directory = os.path.join(FLAGS.working_directory, "MNIST")
@@ -167,13 +167,13 @@ if __name__ == "__main__":
             with tf.variable_scope("encoder") as scope:
                 mean_x, logcov_x = encoder(input_tensor)
             with tf.variable_scope("decoder") as scope:
-                output_tensor, _ = decoder(mean_x, logcov_x)
+                output_tensor, _, _ = decoder(mean_x, logcov_x)
 
         with pt.defaults_scope(phase=pt.Phase.test):
             with tf.variable_scope("encoder", reuse=True) as scope:
                 mean_xt, logcov_xt = encoder(input_tensor)
             with tf.variable_scope("decoder", reuse=True) as scope:
-                mean_yt, xt = decoder(mean_xt, logcov_xt, FLAGS.s)
+                mean_yt, xt, eps = decoder(mean_xt, logcov_xt, FLAGS.s)
 
     ''' edit by hao'''
     # first, get the reconstruction term E_q(X|Y) log p(Y|X)
@@ -196,7 +196,7 @@ if __name__ == "__main__":
     '''END edit by hao'''
 
     overall_loss = qv_reg_loss + qeta_reg_loss + rec_loss + S_loss
-    log_p_yt = get_marginal_likelihood(input_tensor, mean_yt, xt, FLAGS.s, FLAGS.alpha_0, FLAGS.beta_0, qv_alpha, qv_beta, qeta_mu, qeta_sigma)
+    log_p_yt = get_marginal_likelihood(input_tensor, mean_yt, xt, FLAGS.s, qv_alpha, qv_beta, qeta_mu, qeta_sigma, eps)
     # Create optimizers
     encoder_trainables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='encoder')
     decoder_trainables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='decoder')

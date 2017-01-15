@@ -31,6 +31,7 @@ flags.DEFINE_float("learning_rate", 0.01, "learning rate")
 flags.DEFINE_string("working_directory", "", "")
 flags.DEFINE_string("log_directory", "", "")
 flags.DEFINE_integer("hidden_size", 10, "size of the hidden VAE unit")
+flags.DEFINE_integer("s", 100, "number of samples for testing")
 FLAGS = flags.FLAGS
 
 # tanh 
@@ -56,24 +57,43 @@ def encoder(input_tensor):
     logcov_x = x_attributes[:, FLAGS.hidden_size:]
     return mean_x, logcov_x
 
-def decoder(mean=None, logcov=None):
-    epsilon = tf.random_normal([FLAGS.batch_size, FLAGS.hidden_size])
+def decoder(mean=None, logcov=None, s=None):
     if mean is None and logcov is None:
+        epsilon = tf.random_normal([FLAGS.batch_size, FLAGS.hidden_size])
         mean = None
         logcov = None
         stddev = None
         input_sample = epsilon
     else:
         stddev = tf.sqrt(tf.exp(logcov))
-        input_sample = mean + epsilon * stddev
+        if s is None:
+            epsilon = tf.random_normal([FLAGS.batch_size, FLAGS.hidden_size])
+            input_sample = mean + epsilon * stddev
+        else:
+            epsilon = tf.random_normal([s, FLAGS.batch_size, FLAGS.hidden_size])
+            # q_x = tf.exp(-0.5 * tf.reduce_sum(tf.square(epsilon), 2))
+            input_sample = tf.expand_dims(mean, 0) + epsilon * tf.expand_dims(stddev, 0)
+            input_sample = tf.reshape(input_sample, [-1, FLAGS.hidden_size])
     return (pt.wrap(input_sample).
             fully_connected(500, name='decoder_fc1', activation_fn=tf.nn.tanh).
             fully_connected(784, name='decoder_fc2', activation_fn=tf.nn.sigmoid)
-            ).tensor
+            ).tensor, input_sample, epsilon
 
 def get_reconstruction_cost(output_tensor, target_tensor, epsilon=1e-8):
     return tf.reduce_sum(-target_tensor * tf.log(output_tensor + epsilon) -
                          (1.0 - target_tensor) * tf.log(1.0 - output_tensor + epsilon))
+
+def get_marginal_likelihood(yt, mean_yt, xt, s, eps, epsilon = 1e-8):
+    yt_expand = tf.expand_dims(yt, 0)
+    mean_yt = tf.reshape(mean_yt, [s, FLAGS.batch_size, 784])
+    xt = tf.reshape(xt, [s, FLAGS.batch_size, FLAGS.hidden_size])
+    log_p_y_s = tf.reduce_sum(yt_expand * tf.log(mean_yt + epsilon) \
+        + (1.0 - yt_expand) * tf.log(1.0 - mean_yt + epsilon), 2) \
+        - 0.5 * tf.reduce_sum(tf.square(xt), 2) \
+        + 0.5 * tf.reduce_sum(tf.square(eps), 2)
+    
+    log_p_y = tf.log(tf.reduce_mean(tf.exp(log_p_y_s), 0))
+    return tf.reduce_mean(log_p_y)
 
 if __name__ == "__main__":
     data_directory = os.path.join(FLAGS.working_directory, "MNIST")
@@ -99,11 +119,13 @@ if __name__ == "__main__":
             with tf.variable_scope("encoder") as scope:
                 mean_x, logcov_x = encoder(input_tensor)
             with tf.variable_scope("decoder") as scope:
-                output_tensor = decoder(mean_x, logcov_x)
+                output_tensor, _, _ = decoder(mean_x, logcov_x)
 
         with pt.defaults_scope(phase=pt.Phase.test):
+            with tf.variable_scope("encoder", reuse=True) as scope:
+                mean_xt, logcov_xt = encoder(input_tensor)
             with tf.variable_scope("decoder", reuse=True) as scope:
-                sampled_tensor = decoder()
+                mean_yt, xt, eps = decoder(mean_xt, logcov_xt, FLAGS.s)
 
     ''' edit by hao'''
     # first, get the reconstruction term E_q(X|Y) log p(Y|X)
@@ -111,6 +133,7 @@ if __name__ == "__main__":
     rec_loss = 1 / FLAGS.batch_size * get_reconstruction_cost(output_tensor, input_tensor)
     reg_loss = 1 / FLAGS.batch_size * tf.reduce_sum(0.5 * (tf.square(mean_x) + tf.exp(logcov_x) - logcov_x - 1.0))
     vae_loss = rec_loss + reg_loss
+    log_p_yt = get_marginal_likelihood(input_tensor, mean_yt, xt, FLAGS.s, eps)
     
 
     # Create optimizers
@@ -159,18 +182,20 @@ if __name__ == "__main__":
             def eval_ELBO(dataset, name):
                 dataset._index_in_epoch = 0
                 num_iter = int(dataset.num_examples / FLAGS.batch_size)
-                overall_loss_total, rec_loss_total, reg_loss_total = 0.0, 0.0, 0.0
+                overall_loss_total, rec_loss_total, reg_loss_total, heldout_ll = 0.0, 0.0, 0.0, 0.0
                 for i in range(num_iter):
                     x, _ = dataset.next_batch(FLAGS.batch_size)
-                    overall_loss_, rec_loss_, reg_loss_ = sess.run([vae_loss, rec_loss, reg_loss], {input_tensor: x})
+                    overall_loss_, rec_loss_, reg_loss_, heldout_ll_ = sess.run([vae_loss, rec_loss, reg_loss, log_p_yt], {input_tensor: x})
                     overall_loss_total += overall_loss_ 
                     rec_loss_total += rec_loss_
                     reg_loss_total += reg_loss_
+                    heldout_ll += heldout_ll_
                 overall_loss_total = overall_loss_total / num_iter 
                 rec_loss_total = rec_loss_total / num_iter 
                 reg_loss_total = reg_loss_total / num_iter 
-                print("%s ELBO: %f, rec_LL: %f, reg_LL: %f"  
-                    % (name, -overall_loss_total, -rec_loss_total, -reg_loss_total))
+                heldout_ll = heldout_ll / num_iter
+                print("%s ELBO: %f, rec_LL: %f, reg_LL: %f, heldout_nll: %f"  
+                    % (name, -overall_loss_total, -rec_loss_total, -reg_loss_total, -heldout_ll))
 
             # evaluate the validation/test ELBO
             eval_ELBO(mnist_val, 'val')
