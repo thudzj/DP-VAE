@@ -4,9 +4,6 @@ import math
 import os
 import sys
 import numpy as np
-import prettytensor as pt
-
-
 import scipy.misc
 import tensorflow as tf
 from scipy.misc import imsave
@@ -48,10 +45,18 @@ def variable_summaries(var):
         tf.summary.scalar('min', tf.reduce_min(var))
         tf.summary.histogram('histogram', var)
 
+def _weight_variable(name, shape):
+    return tf.get_variable(name, shape, tf.float32, tf.truncated_normal_initializer(stddev=0.1))
+
+def _bias_variable(name, shape):
+    return tf.get_variable(name, shape, tf.float32, tf.constant_initializer(0.1, dtype=tf.float32))
+
 def encoder(input_tensor):
-    mid_features = (pt.wrap(input_tensor).
-            fully_connected(500, name='encoder_fc1', activation_fn=tf.nn.relu))
-    x_attributes = (mid_features.fully_connected(FLAGS.hidden_size * 2, activation_fn=None)).tensor
+    W_fc1 = _weight_variable('W_1', [784, 500])
+    b_fc1 = _bias_variable('b_1', [500])
+    W_fc2 = _weight_variable('W_2', [500, FLAGS.hidden_size * 2])
+    b_fc2 = _bias_variable('b_2', [FLAGS.hidden_size * 2])
+    x_attributes = tf.matmul(tf.nn.relu(tf.matmul(input_tensor, W_fc1) + b_fc1), W_fc2) + b_fc2
     mean_x = x_attributes[:, :FLAGS.hidden_size]
     logcov_x = x_attributes[:, FLAGS.hidden_size:]
     return mean_x, logcov_x
@@ -73,10 +78,11 @@ def decoder(mean=None, logcov=None, s=None):
             # q_x = tf.exp(-0.5 * tf.reduce_sum(tf.square(epsilon), 2))
             input_sample = tf.expand_dims(mean, 0) + epsilon * tf.expand_dims(stddev, 0)
             input_sample = tf.reshape(input_sample, [-1, FLAGS.hidden_size])
-    return (pt.wrap(input_sample).
-            fully_connected(500, name='decoder_fc1', activation_fn=tf.nn.relu).
-            fully_connected(784, name='decoder_fc2', activation_fn=tf.nn.sigmoid)
-            ).tensor, input_sample, epsilon
+    W_fc1 = _weight_variable('W_1', [FLAGS.hidden_size, 500])
+    b_fc1 = _bias_variable('b_1', [500])
+    W_fc2 = _weight_variable('W_2', [500, 784])
+    b_fc2 = _bias_variable('b_2', [784])
+    return tf.nn.sigmoid(tf.matmul(tf.nn.relu(tf.matmul(input_sample, W_fc1) + b_fc1), W_fc2) + b_fc2), input_sample, epsilon
 
 def get_reconstruction_cost(output_tensor, target_tensor, epsilon=1e-8):
     return tf.reduce_sum(-target_tensor * tf.log(output_tensor + epsilon) -
@@ -159,22 +165,15 @@ if __name__ == "__main__":
     N = mnist_train.num_examples
     input_tensor = tf.placeholder(tf.float32, [FLAGS.batch_size, 28 * 28])
 
-    with pt.defaults_scope(activation_fn=tf.nn.relu):
-                           #batch_normalize=True,
-                           #learned_moments_update_rate=0.0003,
-                           #variance_epsilon=0.001,
-                           #scale_after_normalization=True):
-        with pt.defaults_scope(phase=pt.Phase.train):
-            with tf.variable_scope("encoder") as scope:
-                mean_x, logcov_x = encoder(input_tensor)
-            with tf.variable_scope("decoder") as scope:
-                output_tensor, _, _ = decoder(mean_x, logcov_x)
+    with tf.variable_scope("encoder") as scope:
+        mean_x, logcov_x = encoder(input_tensor)
+    with tf.variable_scope("decoder") as scope:
+        output_tensor, _, _ = decoder(mean_x, logcov_x)
 
-        with pt.defaults_scope(phase=pt.Phase.test):
-            with tf.variable_scope("encoder", reuse=True) as scope:
-                mean_xt, logcov_xt = encoder(input_tensor)
-            with tf.variable_scope("decoder", reuse=True) as scope:
-                mean_yt, xt, eps = decoder(mean_xt, logcov_xt, FLAGS.s)
+    with tf.variable_scope("encoder", reuse=True) as scope:
+        mean_xt, logcov_xt = encoder(input_tensor)
+    with tf.variable_scope("decoder", reuse=True) as scope:
+        mean_yt, xt, eps = decoder(mean_xt, logcov_xt, FLAGS.s)
 
     ''' edit by hao'''
     # first, get the reconstruction term E_q(X|Y) log p(Y|X)
