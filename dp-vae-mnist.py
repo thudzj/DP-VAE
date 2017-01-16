@@ -29,7 +29,7 @@ flags.DEFINE_integer("updates_per_epoch", 600, "number of updates per epoch") #1
 flags.DEFINE_integer("max_epoch", 1000, "max epoch") #100
 flags.DEFINE_float("learning_rate", 0.01, "learning rate")
 flags.DEFINE_string("working_directory", "", "")
-flags.DEFINE_integer("hidden_size", 10, "size of the hidden VAE unit")
+flags.DEFINE_integer("hidden_size", 50, "size of the hidden VAE unit")
 flags.DEFINE_integer("T", 10, "level of truncation")
 flags.DEFINE_float("lam", 1.0, "weight of the regularizer")
 flags.DEFINE_float("alpha_0", 1.0, "alpha_0 for the prior Beta distribution")
@@ -50,7 +50,7 @@ def variable_summaries(var):
 
 def encoder(input_tensor):
     mid_features = (pt.wrap(input_tensor).
-            fully_connected(500, name='encoder_fc1', activation_fn=tf.nn.tanh))
+            fully_connected(500, name='encoder_fc1', activation_fn=tf.nn.relu))
     x_attributes = (mid_features.fully_connected(FLAGS.hidden_size * 2, activation_fn=None)).tensor
     mean_x = x_attributes[:, :FLAGS.hidden_size]
     logcov_x = x_attributes[:, FLAGS.hidden_size:]
@@ -74,7 +74,7 @@ def decoder(mean=None, logcov=None, s=None):
             input_sample = tf.expand_dims(mean, 0) + epsilon * tf.expand_dims(stddev, 0)
             input_sample = tf.reshape(input_sample, [-1, FLAGS.hidden_size])
     return (pt.wrap(input_sample).
-            fully_connected(500, name='decoder_fc1', activation_fn=tf.nn.tanh).
+            fully_connected(500, name='decoder_fc1', activation_fn=tf.nn.relu).
             fully_connected(784, name='decoder_fc2', activation_fn=tf.nn.sigmoid)
             ).tensor, input_sample, epsilon
 
@@ -159,11 +159,11 @@ if __name__ == "__main__":
     N = mnist_train.num_examples
     input_tensor = tf.placeholder(tf.float32, [FLAGS.batch_size, 28 * 28])
 
-    with pt.defaults_scope(activation_fn=tf.nn.tanh,
-                           batch_normalize=True,
-                           learned_moments_update_rate=0.0003,
-                           variance_epsilon=0.001,
-                           scale_after_normalization=True):
+    with pt.defaults_scope(activation_fn=tf.nn.relu):
+                           #batch_normalize=True,
+                           #learned_moments_update_rate=0.0003,
+                           #variance_epsilon=0.001,
+                           #scale_after_normalization=True):
         with pt.defaults_scope(phase=pt.Phase.train):
             with tf.variable_scope("encoder") as scope:
                 mean_x, logcov_x = encoder(input_tensor)
@@ -206,14 +206,14 @@ if __name__ == "__main__":
 
     # create the optimizer
     global_step = tf.Variable(0, trainable=False)
-    learning_rate = tf.train.exponential_decay(FLAGS.learning_rate, global_step, updates_per_epoch * 50, 0.9, staircase = True)
-    optimizer = tf.train.AdamOptimizer(learning_rate, epsilon=1.0)
+    #learning_rate = tf.train.exponential_decay(FLAGS.learning_rate, global_step, updates_per_epoch * 50, 1.0, staircase = True)
+    optimizer = tf.train.AdamOptimizer(learning_rate = 0.0003, beta1 = 0.95, beta2 = 0.999, epsilon=1.0)
     learning_step = optimizer.minimize(overall_loss, var_list = encoder_trainables + decoder_trainables + [qeta_mu, qeta_sigma, qv_alpha, qv_beta], global_step = global_step)
 
-    global_step_vi = tf.Variable(0, trainable=False)
-    learning_rate_vi = tf.train.exponential_decay(FLAGS.learning_rate, global_step_vi, updates_per_epoch * 50, 0.9, staircase = True)
-    optimizer_vi = tf.train.AdamOptimizer(learning_rate_vi, epsilon=1.0)
-    learning_step_vi = optimizer.minimize(overall_loss, var_list = [qv_alpha, qv_beta], global_step = global_step_vi)
+    #global_step_vi = tf.Variable(0, trainable=False)
+    #learning_rate_vi = tf.train.exponential_decay(FLAGS.learning_rate, global_step_vi, updates_per_epoch * 50, 0.9, staircase = True)
+    #optimizer_vi = tf.train.AdamOptimizer(learning_rate_vi, epsilon=1.0)
+    #learning_step_vi = optimizer.minimize(overall_loss, var_list = [qv_alpha, qv_beta], global_step = global_step_vi)
 
     tf.summary.scalar('overall_loss', overall_loss)
     tf.summary.scalar('rec_loss', rec_loss)
@@ -221,37 +221,42 @@ if __name__ == "__main__":
     tf.summary.scalar('qv_reg_loss', qv_reg_loss)
     tf.summary.scalar('qeta_reg_loss', qeta_reg_loss)
     merged = tf.summary.merge_all()
-    loader = tf.train.Saver(encoder_trainables + decoder_trainables)
+    loader = tf.train.Saver(encoder_trainables + decoder_trainables + [qv_alpha, qv_beta, qeta_mu, qeta_sigma])
 
     init = tf.initialize_all_variables()
     with tf.Session() as sess:
+        train_writer = tf.summary.FileWriter(FLAGS.working_directory + 'tb/dp_vae_mnist/train_relu_beta_1_50', sess.graph)
         sess.run(init)
 
-        train_writer = tf.summary.FileWriter(FLAGS.working_directory + 'tb/dp_vae_mnist/train3', sess.graph)
         # init the encoder and decoder parameters
         #print("restore the encoder and decoder parameters")
         #loader.restore(sess, "trained/initialization.ckpt")
         print("Training the dp-vae model")
+        best_train_rec, best_test_rec, best_val_rec = 999999, 9999999, 9999999
+        best_val_heldout, best_test_heldout = 999999, 999999
         mnist_train._index_in_epoch = 0
         for epoch in range(FLAGS.max_epoch):
             # first, let train the encoder and decoder for a while:
             overall_loss_total, rec_loss_total, S_loss_total, qeta_reg_loss_total, qv_reg_loss_total = 0.0, 0.0, 0.0, 0.0, 0.0
             for i in range(updates_per_epoch):
                 x, _ = mnist_train.next_batch(FLAGS.batch_size)
-                _, overall_loss_, rec_loss_, S_loss_, qeta_reg_loss_, qv_reg_loss_, lr_, summary, step = sess.run([learning_step, overall_loss, rec_loss, S_loss, qeta_reg_loss, qv_reg_loss, learning_rate, merged, global_step], {input_tensor: x}) 
+                _, overall_loss_, rec_loss_, S_loss_, qeta_reg_loss_, qv_reg_loss_, summary, step = sess.run([learning_step, overall_loss, rec_loss, S_loss, qeta_reg_loss, qv_reg_loss, merged, global_step], {input_tensor: x}) 
                 overall_loss_total += overall_loss_ 
                 #print("epoch %d: iter %d, rec_loss: %f, S_loss: %f, qeta_loss: %f, qv_loss: %f" % (epoch, i, rec_loss_, S_loss_, qeta_reg_loss_, qv_reg_loss_))
                 rec_loss_total += rec_loss_
                 S_loss_total += S_loss_
                 qeta_reg_loss_total += qeta_reg_loss_
                 qv_reg_loss_total += qv_reg_loss_
+                train_writer.add_summary(summary, step)
             overall_loss_total = overall_loss_total / updates_per_epoch 
             rec_loss_total = rec_loss_total / updates_per_epoch
             S_loss_total = S_loss_total / updates_per_epoch
             qeta_reg_loss_total = qeta_reg_loss_total / updates_per_epoch
             qv_reg_loss_total = qv_reg_loss_total / updates_per_epoch
-            print("train ELBO: %f, rec_LL: %f, S_LL: %f, qeta_reg_LL: %f, qv_reg_LL: %f; epoch %d, lr %f..." 
-                % (-overall_loss_total, -rec_loss_total, -S_loss_total, -qeta_reg_loss_total, -qv_reg_loss_total, epoch, lr_, ))
+            if rec_loss_total <= best_train_rec:
+                best_train_rec = rec_loss_total
+            print("train ELBO: %f, rec_LL: %f, S_LL: %f, qeta_reg_LL: %f, qv_reg_LL: %f; epoch %d..." 
+                % (-overall_loss_total, -rec_loss_total, -S_loss_total, -qeta_reg_loss_total, -qv_reg_loss_total, epoch))
 
             def eval_ELBO(dataset, name):
                 dataset._index_in_epoch = 0
@@ -277,6 +282,20 @@ if __name__ == "__main__":
                 heldout_ll = heldout_ll / num_iter
                 print("%s ELBO: %f, rec_LL: %f, S_LL: %f, qeta_reg_LL: %f, qv_reg_LL: %f, heldout_nll: %f..." 
                     % (name, -overall_loss_total, -rec_loss_total, -S_loss_total, -qeta_reg_loss_total, -qv_reg_loss_total, -heldout_ll))
+                return rec_loss_total, heldout_ll
 
-            eval_ELBO(mnist_val, 'val')
-            eval_ELBO(mnist_test, 'test')
+            val_rec, val_heldout = eval_ELBO(mnist_val, 'val')
+            test_rec, test_heldout = eval_ELBO(mnist_test, 'test')
+            if val_rec < best_val_rec:
+                best_val_rec = val_rec
+            if test_rec < best_test_rec:
+                best_test_rec = test_rec
+            if val_heldout < best_val_heldout:
+                best_val_heldout = val_heldout
+            if test_heldout < best_test_heldout:
+                best_test_heldout = test_heldout
+            #evaluate the marginal likelihood.
+        print("best train rec %f, val rec %f, test rec %f.." % (-best_train_rec, -best_val_rec, -best_test_rec))
+        print("best val heldout-ll %f, test heldout-ll %f.." % (-best_val_heldout, -best_test_heldout))
+        loader.save(sess, train_writer.get_logdir() + '/final_model.ckpt')
+    train_writer.close()
