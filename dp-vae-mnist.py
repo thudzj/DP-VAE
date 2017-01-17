@@ -60,27 +60,31 @@ def encoder(input_tensor):
     return mean_x, logcov_x
 
 def decoder(mean=None, logcov=None, s=None):
-    if mean is None and logcov is None:
+    stddev = tf.sqrt(tf.exp(logcov))
+    if s is None:
         epsilon = tf.random_normal([FLAGS.batch_size, FLAGS.hidden_size])
-        mean = None
-        logcov = None
-        stddev = None
-        input_sample = epsilon
+        input_sample = mean + epsilon * stddev
     else:
-        stddev = tf.sqrt(tf.exp(logcov))
-        if s is None:
-            epsilon = tf.random_normal([FLAGS.batch_size, FLAGS.hidden_size])
-            input_sample = mean + epsilon * stddev
-        else:
-            epsilon = tf.random_normal([s, FLAGS.batch_size, FLAGS.hidden_size])
-            # q_x = tf.exp(-0.5 * tf.reduce_sum(tf.square(epsilon), 2))
-            input_sample = tf.expand_dims(mean, 0) + epsilon * tf.expand_dims(stddev, 0)
-            input_sample = tf.reshape(input_sample, [-1, FLAGS.hidden_size])
+        epsilon = tf.random_normal([s, FLAGS.batch_size, FLAGS.hidden_size])
+        # q_x = tf.exp(-0.5 * tf.reduce_sum(tf.square(epsilon), 2))
+        input_sample = tf.expand_dims(mean, 0) + epsilon * tf.expand_dims(stddev, 0)
+        input_sample = tf.reshape(input_sample, [-1, FLAGS.hidden_size])
     W_fc1 = _weight_variable('W_1', [FLAGS.hidden_size, 500])
     b_fc1 = _bias_variable('b_1', [500])
     W_fc2 = _weight_variable('W_2', [500, 784])
     b_fc2 = _bias_variable('b_2', [784])
     return tf.nn.sigmoid(tf.matmul(tf.nn.relu(tf.matmul(input_sample, W_fc1) + b_fc1), W_fc2) + b_fc2), input_sample, epsilon
+
+def sample(qeta_mu, sigma_px):
+    epsilon = tf.random_normal([FLAGS.T, int(FLAGS.batch_size / FLAGS.T), FLAGS.hidden_size])
+    means = tf.expand_dims(tf.transpose(qeta_mu), 1)
+    covs = tf.expand_dims(tf.transpose(sigma_px), 1)
+    input_sample = tf.reshape(epsilon * covs + means, [-1, FLAGS.hidden_size])
+    W_fc1 = _weight_variable('W_1', [FLAGS.hidden_size, 500])
+    b_fc1 = _bias_variable('b_1', [500])
+    W_fc2 = _weight_variable('W_2', [500, 784])
+    b_fc2 = _bias_variable('b_2', [784])
+    return tf.reshape(tf.nn.sigmoid(tf.matmul(tf.nn.relu(tf.matmul(input_sample, W_fc1) + b_fc1), W_fc2) + b_fc2), [FLAGS.T, int(FLAGS.batch_size / FLAGS.T), 784])
 
 def get_reconstruction_cost(output_tensor, target_tensor, epsilon=1e-8):
     return tf.reduce_sum(-target_tensor * tf.log(output_tensor + epsilon) -
@@ -139,7 +143,7 @@ def get_marginal_likelihood(yt, mean_yt, xt, s, alpha, beta, eta_mu, eta_sigma, 
     # p_ygivenx = tf.reduce_prod(tf.pow(mean_yt, yt_expand) * tf.pow(1 - mean_yt, 1 - yt_expand), axis=2)
     v = alpha / (alpha + beta)
     pi = tf.concat(0, [v, [1.0]]) * tf.concat(0, [[1.0], tf.cumprod(1 - v)])
-    p_x = gaussian_mixture_pdf(eta_mu, eta_sigma + sigma_px, xt, pi)
+    p_x = gaussian_mixture_pdf(eta_mu, tf.square(eta_sigma) + tf.square(sigma_px), xt, pi)
     log_p_y_s = tf.reduce_sum(yt_expand * tf.log(mean_yt + epsilon) \
         + (1.0 - yt_expand) * tf.log(1.0 - mean_yt + epsilon), 2) \
         + tf.log(p_x) \
@@ -196,6 +200,9 @@ if __name__ == "__main__":
     S_loss = 1 / FLAGS.batch_size * S_loss 
     '''END edit by hao'''
 
+    with tf.variable_scope("decoder", reuse=True) as scope:
+        samples = sample(qeta_mu, sigma_px)
+
     vae_loss = rec_loss + tf.reduce_sum(0.5 * (tf.square(mean_x) + tf.exp(logcov_x) - logcov_x - 1.0)) / FLAGS.batch_size
     overall_loss = qv_reg_loss + qeta_reg_loss + rec_loss + S_loss
     log_p_yt = get_marginal_likelihood(input_tensor, mean_yt, xt, FLAGS.s, qv_alpha, qv_beta, qeta_mu, qeta_sigma, eps, sigma_px)
@@ -231,7 +238,7 @@ if __name__ == "__main__":
         sess.run(init)
 
         print("Pretraining the dp-vae model")
-        for iii in range(20):
+        for iii in range(30):
             ve_loss = 0.0
             for i in range(updates_per_epoch):
                 x, _ = mnist_train.next_batch(FLAGS.batch_size)
@@ -249,7 +256,7 @@ if __name__ == "__main__":
             features[i * FLAGS.batch_size: (i + 1) * FLAGS.batch_size, :] = mean_x_
             labels[i * FLAGS.batch_size: (i + 1) * FLAGS.batch_size] = y
 
-        model = BayesianGaussianMixture(n_components = FLAGS.T, max_iter = 300, covariance_type = 'diag')
+        model = BayesianGaussianMixture(n_components = FLAGS.T, max_iter = 300, covariance_type = 'diag', weight_concentration_prior=2)
         model.fit(features)
         preds = model.predict(features)
         print("------------> Fit a Bayesian GMM: acc: %f, nmi: %f" % (cluster_acc(preds, labels), cluster_nmi(preds, labels)))
@@ -330,6 +337,15 @@ if __name__ == "__main__":
                 best_val_heldout = val_heldout
             if test_heldout < best_test_heldout:
                 best_test_heldout = test_heldout
+
+            if epoch % 20 == 0:
+                [imgs] = sess.run([samples])
+                imgs_folder = os.path.join('imgs', str(epoch))
+                if not os.path.exists(imgs_folder):
+                    os.makedirs(imgs_folder)
+                for k in range(FLAGS.T):
+                    for j in range(int(FLAGS.batch_size / FLAGS.T)):
+                        imsave(os.path.join(imgs_folder, '%d_%d.png') % (k, j), imgs[k][j].reshape(28, 28))
             #evaluate the marginal likelihood.
         print("best train rec %f, val rec %f, test rec %f.." % (-best_train_rec, -best_val_rec, -best_test_rec))
         print("best val heldout-ll %f, test heldout-ll %f.." % (-best_val_heldout, -best_test_heldout))
