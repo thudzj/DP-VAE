@@ -29,8 +29,6 @@ flags.DEFINE_string("working_directory", "", "")
 flags.DEFINE_integer("hidden_size", 50, "size of the hidden VAE unit")
 flags.DEFINE_integer("T", 10, "level of truncation")
 flags.DEFINE_float("lam", 1.0, "weight of the regularizer")
-flags.DEFINE_float("alpha_0", 1.0, "alpha_0 for the prior Beta distribution")
-flags.DEFINE_float("beta_0", 1.0, "beta_0 for the prior Beta distribution")
 flags.DEFINE_integer("s", 100, "number of samples for testing")
 FLAGS = flags.FLAGS
 
@@ -106,8 +104,7 @@ def get_qeta_reg_loss(mu, sigma):
                 - tf.square(sigma) / tf.square(sigma_0)
                 - tf.square(mu - mu_0) / tf.square(sigma_0))
 
-def get_S_loss_hao(mean_x, logcov_x, qv_alpha, qv_beta, qeta_mu, qeta_sigma, epsilon = 1e-8):
-    sigma_px = 1.0
+def get_S_loss_hao(mean_x, logcov_x, qv_alpha, qv_beta, qeta_mu, qeta_sigma, sigma_px, epsilon = 1e-8):
     S1 = tf.digamma(qv_alpha) - tf.digamma(qv_alpha + qv_beta) 
     S2 = tf.cumsum(tf.digamma(qv_beta) - tf.digamma(qv_alpha + qv_beta))
 
@@ -115,9 +112,10 @@ def get_S_loss_hao(mean_x, logcov_x, qv_alpha, qv_beta, qeta_mu, qeta_sigma, eps
     logcov_x_expand = tf.expand_dims(logcov_x, 1)
     qeta_mu_expand = tf.expand_dims(tf.transpose(qeta_mu), 0)
     qeta_sigma_expand = tf.expand_dims(tf.transpose(qeta_sigma), 0)
-    S3 = 0.5 * tf.reduce_sum(1 + logcov_x_expand - 2 * tf.log(sigma_px) \
+    sigma_px_expand = tf.expand_dims(tf.transpose(sigma_px), 0)
+    S3 = 0.5 * tf.reduce_sum(1 + logcov_x_expand - 2 * tf.log(sigma_px_expand) \
             - (tf.exp(logcov_x_expand) + tf.square(qeta_sigma_expand) \
-            + tf.square(mean_x_expand - qeta_mu_expand)) / tf.square(sigma_px), 2)
+            + tf.square(mean_x_expand - qeta_mu_expand)) / tf.square(sigma_px_expand), 2)
     S = S3 + tf.concat(0, [S1, [0.0]]) + tf.concat(0, [[0.0], S2])
     # get the variational distribution q(z)
     S_max = tf.reduce_max(S, reduction_indices=1)
@@ -134,8 +132,7 @@ def gaussian_mixture_pdf(mu, sigma, x, pi):
     return tf.reduce_sum(1 / tf.sqrt(tf.reduce_prod(sigma_expand, 3)) 
                         * tf.exp(-0.5 * tf.reduce_sum(tf.square(x - mu_expand) / sigma_expand, 3)) * tf.reshape(pi, [-1, 1, 1]), 0)
 
-def get_marginal_likelihood(yt, mean_yt, xt, s, alpha, beta, eta_mu, eta_sigma, eps, epsilon = 1e-8):
-    sigma_px = 1.0 
+def get_marginal_likelihood(yt, mean_yt, xt, s, alpha, beta, eta_mu, eta_sigma, eps, sigma_px, epsilon = 1e-8):
     yt_expand = tf.expand_dims(yt, 0)
     mean_yt = tf.reshape(mean_yt, [s, FLAGS.batch_size, 784])
     xt = tf.reshape(xt, [1, s, FLAGS.batch_size, FLAGS.hidden_size])
@@ -181,9 +178,12 @@ if __name__ == "__main__":
     rec_loss = 1 / FLAGS.batch_size * get_reconstruction_cost(output_tensor, input_tensor)
 
     # second, get the q(v|Y) reg loss E_q log \frac{q(v|alpha, beta)}{q(v|Y)}
-    qv_alpha = tf.Variable(tf.ones([FLAGS.T - 1]), name = "qv_alpha") # vi parameters
+    qv_alpha = tf.Variable((1 / (FLAGS.T - np.arange(1, FLAGS.T))).astype(np.float32), name = "qv_alpha") # vi parameters
     qv_beta = tf.Variable(tf.ones([FLAGS.T - 1]), name = "qv_beta")  # vi parameters
-    qv_reg_loss = 1 / FLAGS.batch_size * get_qv_reg_loss(qv_alpha, qv_beta, FLAGS.alpha_0, FLAGS.beta_0)
+    # alpha_0 = (1 / (FLAGS.T - np.arange(1, FLAGS.T))).astype(np.float32)
+    alpha_0 = np.ones([FLAGS.T - 1]).astype(np.float32)
+    beta_0 = np.ones([FLAGS.T - 1]).astype(np.float32)
+    qv_reg_loss = 1 / FLAGS.batch_size * get_qv_reg_loss(qv_alpha, qv_beta, alpha_0, beta_0)
 
     # third, get the q(\eta|Y) reg loss E_q log \frac{q(\eta|\mu_0, \sigma_0^2)}{q(\eta | Y)}
     qeta_mu = tf.Variable(tf.random_uniform([FLAGS.hidden_size, FLAGS.T]), name = 'qeta_mu') # vi parameters 
@@ -191,12 +191,14 @@ if __name__ == "__main__":
     qeta_reg_loss = 1 / FLAGS.batch_size * get_qeta_reg_loss(qeta_mu, qeta_sigma)
 
     # forth, get the remained loss E_q log \frac {p(z|v) p(x|z,y)} {q(z) q(x|y)}
-    S_loss, qz, S = get_S_loss_hao(mean_x, logcov_x, qv_alpha, qv_beta, qeta_mu, qeta_sigma)
+    sigma_px = tf.Variable(tf.ones([FLAGS.hidden_size, FLAGS.T]), name = 'sigma_px', trainable=False)
+    S_loss, qz, S = get_S_loss_hao(mean_x, logcov_x, qv_alpha, qv_beta, qeta_mu, qeta_sigma, sigma_px)
     S_loss = 1 / FLAGS.batch_size * S_loss 
     '''END edit by hao'''
 
+    vae_loss = rec_loss + tf.reduce_sum(0.5 * (tf.square(mean_x) + tf.exp(logcov_x) - logcov_x - 1.0)) / FLAGS.batch_size
     overall_loss = qv_reg_loss + qeta_reg_loss + rec_loss + S_loss
-    log_p_yt = get_marginal_likelihood(input_tensor, mean_yt, xt, FLAGS.s, qv_alpha, qv_beta, qeta_mu, qeta_sigma, eps)
+    log_p_yt = get_marginal_likelihood(input_tensor, mean_yt, xt, FLAGS.s, qv_alpha, qv_beta, qeta_mu, qeta_sigma, eps, sigma_px)
     # Create optimizers
     encoder_trainables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='encoder')
     decoder_trainables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='decoder')
@@ -207,6 +209,7 @@ if __name__ == "__main__":
     global_step = tf.Variable(0, trainable=False)
     #learning_rate = tf.train.exponential_decay(FLAGS.learning_rate, global_step, updates_per_epoch * 50, 1.0, staircase = True)
     optimizer = tf.train.AdamOptimizer(learning_rate = 0.0003, beta1 = 0.95, beta2 = 0.999, epsilon=1.0)
+    pretraining_step = optimizer.minimize(vae_loss, var_list = encoder_trainables + decoder_trainables)
     learning_step = optimizer.minimize(overall_loss, var_list = encoder_trainables + decoder_trainables + [qeta_mu, qeta_sigma, qv_alpha, qv_beta], global_step = global_step)
 
     #global_step_vi = tf.Variable(0, trainable=False)
@@ -227,6 +230,35 @@ if __name__ == "__main__":
         train_writer = tf.summary.FileWriter(FLAGS.working_directory + 'tb/dp_vae_mnist/train_relu_beta_1_50', sess.graph)
         sess.run(init)
 
+        print("Pretraining the dp-vae model")
+        for iii in range(20):
+            ve_loss = 0.0
+            for i in range(updates_per_epoch):
+                x, _ = mnist_train.next_batch(FLAGS.batch_size)
+                _, vae_loss_ = sess.run([pretraining_step, vae_loss], {input_tensor: x}) 
+                ve_loss += vae_loss_
+            ve_loss /= updates_per_epoch
+            print("Pretrain vae loss: %f" % (ve_loss))
+
+        mnist_train._index_in_epoch = 0
+        features = np.zeros([N, FLAGS.hidden_size])
+        labels = np.zeros((N))
+        for i in range(updates_per_epoch):
+            x, y = mnist_train.next_batch(FLAGS.batch_size)
+            [mean_x_] = sess.run([mean_x], {input_tensor: x})
+            features[i * FLAGS.batch_size: (i + 1) * FLAGS.batch_size, :] = mean_x_
+            labels[i * FLAGS.batch_size: (i + 1) * FLAGS.batch_size] = y
+
+        model = BayesianGaussianMixture(n_components = FLAGS.T, max_iter = 300, covariance_type = 'diag')
+        model.fit(features)
+        preds = model.predict(features)
+        print("------------> Fit a Bayesian GMM: acc: %f, nmi: %f" % (cluster_acc(preds, labels), cluster_nmi(preds, labels)))
+        # init other variational distributions
+        assign_op = qeta_mu.assign(model.means_.T)
+        sess.run(assign_op)
+        # assign_op = sigma_px.assign(model.covariances_.T)
+        # sess.run(assign_op)
+
         # init the encoder and decoder parameters
         #print("restore the encoder and decoder parameters")
         #loader.restore(sess, "trained/initialization.ckpt")
@@ -237,9 +269,10 @@ if __name__ == "__main__":
         for epoch in range(FLAGS.max_epoch):
             # first, let train the encoder and decoder for a while:
             overall_loss_total, rec_loss_total, S_loss_total, qeta_reg_loss_total, qv_reg_loss_total = 0.0, 0.0, 0.0, 0.0, 0.0
+            stats = np.zeros([FLAGS.T])
             for i in range(updates_per_epoch):
                 x, _ = mnist_train.next_batch(FLAGS.batch_size)
-                _, overall_loss_, rec_loss_, S_loss_, qeta_reg_loss_, qv_reg_loss_, summary, step = sess.run([learning_step, overall_loss, rec_loss, S_loss, qeta_reg_loss, qv_reg_loss, merged, global_step], {input_tensor: x}) 
+                _, overall_loss_, rec_loss_, S_loss_, qeta_reg_loss_, qv_reg_loss_, qz_, summary, step = sess.run([learning_step, overall_loss, rec_loss, S_loss, qeta_reg_loss, qv_reg_loss, qz, merged, global_step], {input_tensor: x}) 
                 overall_loss_total += overall_loss_ 
                 #print("epoch %d: iter %d, rec_loss: %f, S_loss: %f, qeta_loss: %f, qv_loss: %f" % (epoch, i, rec_loss_, S_loss_, qeta_reg_loss_, qv_reg_loss_))
                 rec_loss_total += rec_loss_
@@ -247,6 +280,9 @@ if __name__ == "__main__":
                 qeta_reg_loss_total += qeta_reg_loss_
                 qv_reg_loss_total += qv_reg_loss_
                 train_writer.add_summary(summary, step)
+                assignment_ = np.zeros((FLAGS.batch_size, FLAGS.T)) 
+                assignment_[np.arange(FLAGS.batch_size), np.argmax(qz_, axis = 1)] = 1
+                stats += np.sum(assignment_, axis = 0)
             overall_loss_total = overall_loss_total / updates_per_epoch 
             rec_loss_total = rec_loss_total / updates_per_epoch
             S_loss_total = S_loss_total / updates_per_epoch
@@ -254,8 +290,9 @@ if __name__ == "__main__":
             qv_reg_loss_total = qv_reg_loss_total / updates_per_epoch
             if rec_loss_total <= best_train_rec:
                 best_train_rec = rec_loss_total
-            print("train ELBO: %f, rec_LL: %f, S_LL: %f, qeta_reg_LL: %f, qv_reg_LL: %f; epoch %d..." 
+            print("train ELBO: %f, rec_LL: %f, S_LL: %f, qeta_reg_LL: %f, qv_reg_LL: %f, epoch %d..." 
                 % (-overall_loss_total, -rec_loss_total, -S_loss_total, -qeta_reg_loss_total, -qv_reg_loss_total, epoch))
+            print("Assigments: ", stats)
 
             def eval_ELBO(dataset, name):
                 dataset._index_in_epoch = 0
