@@ -186,7 +186,7 @@ if __name__ == "__main__":
     qv_beta = tf.Variable(tf.ones([FLAGS.T - 1]), name = "qv_beta")  # vi parameters
     # alpha_0 = (1 / (FLAGS.T - np.arange(1, FLAGS.T))).astype(np.float32)
     alpha_0 = np.ones([FLAGS.T - 1]).astype(np.float32)
-    beta_0 = np.ones([FLAGS.T - 1]).astype(np.float32)
+    beta_0 = 100 * np.ones([FLAGS.T - 1]).astype(np.float32)
     qv_reg_loss = 1 / FLAGS.batch_size * get_qv_reg_loss(qv_alpha, qv_beta, alpha_0, beta_0)
 
     # third, get the q(\eta|Y) reg loss E_q log \frac{q(\eta|\mu_0, \sigma_0^2)}{q(\eta | Y)}
@@ -231,11 +231,11 @@ if __name__ == "__main__":
     tf.summary.scalar('qeta_reg_loss', qeta_reg_loss)
     merged = tf.summary.merge_all()
     loader = tf.train.Saver(encoder_trainables + decoder_trainables + [qv_alpha, qv_beta, qeta_mu, qeta_sigma])
-    logdir = FLAGS.working_directory + 'tb/dp_vae_mnist' + FLAGS.logdir    
-
+    
+    save_dir = 'tb/dp_vae_mnist/' + FLAGS.logdir
     init = tf.initialize_all_variables()
     with tf.Session() as sess:
-        train_writer = tf.summary.FileWriter(logdir, sess.graph)
+        train_writer = tf.summary.FileWriter(save_dir, sess.graph)
         sess.run(init)
 
         print("Pretraining the dp-vae model")
@@ -327,7 +327,7 @@ if __name__ == "__main__":
                 qv_reg_loss_total = qv_reg_loss_total / num_iter
                 heldout_ll = heldout_ll / num_iter
                 print("%s ELBO: %f, rec_LL: %f, S_LL: %f, qeta_reg_LL: %f, qv_reg_LL: %f, heldout_nll: %f..." 
-                    % (name, -overall_loss_total, -rec_loss_total, -S_loss_total, -qeta_reg_loss_total, -qv_reg_loss_total, -heldout_ll))
+                    % (name, -overall_loss_total, -rec_loss_total, -S_loss_total, -qeta_reg_loss_total, -qv_reg_loss_total, heldout_ll))
                 return rec_loss_total, heldout_ll
 
             val_rec, val_heldout = eval_ELBO(mnist_val, 'val')
@@ -336,14 +336,14 @@ if __name__ == "__main__":
                 best_val_rec = val_rec
             if test_rec < best_test_rec:
                 best_test_rec = test_rec
-            if val_heldout < best_val_heldout:
-                best_val_heldout = val_heldout
-            if test_heldout < best_test_heldout:
-                best_test_heldout = test_heldout
+            if -val_heldout < best_val_heldout:
+                best_val_heldout = -val_heldout
+            if -test_heldout < best_test_heldout:
+                best_test_heldout = -test_heldout
 
             if epoch % 20 == 0:
                 [imgs] = sess.run([samples])
-                imgs_folder = os.path.join(logdir, 'imgs', str(epoch))
+                imgs_folder = os.path.join(save_dir, 'imgs', str(epoch))
                 if not os.path.exists(imgs_folder):
                     os.makedirs(imgs_folder)
                 for k in range(FLAGS.T):
