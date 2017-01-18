@@ -198,13 +198,16 @@ if __name__ == "__main__":
     sigma_px = tf.Variable(tf.ones([FLAGS.hidden_size, FLAGS.T]), name = 'sigma_px', trainable=False)
     S_loss, qz, S = get_S_loss_hao(mean_x, logcov_x, qv_alpha, qv_beta, qeta_mu, qeta_sigma, sigma_px)
     S_loss = 1 / FLAGS.batch_size * S_loss 
+    regularizer = - tf.reduce_sum(tf.log(qz + 1e-8) * qz) / FLAGS.batch_size
+    qz_all = tf.reduce_mean(qz, axis = 0)
+    regularizer_all = tf.reduce_sum(tf.log(qz_all + 1e-8) * qz_all)
     '''END edit by hao'''
 
     with tf.variable_scope("decoder", reuse=True) as scope:
         samples = sample(qeta_mu, sigma_px)
 
     vae_loss = rec_loss #+ tf.reduce_sum(0.5 * (tf.square(mean_x) + tf.exp(logcov_x) - logcov_x - 1.0)) / FLAGS.batch_size
-    overall_loss = qv_reg_loss + qeta_reg_loss + rec_loss + S_loss
+    overall_loss = qv_reg_loss + qeta_reg_loss + rec_loss + S_loss + regularizer * 10 + regularizer_all * 100
     log_p_yt = get_marginal_likelihood(input_tensor, mean_yt, xt, FLAGS.s, qv_alpha, qv_beta, qeta_mu, qeta_sigma, eps, sigma_px)
     # Create optimizers
     encoder_trainables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='encoder')
