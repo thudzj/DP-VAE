@@ -9,10 +9,9 @@ import tensorflow as tf
 from scipy.misc import imsave
 from tensorflow.examples.tutorials.mnist import input_data
 from util.dataset import make_dataset
-from util.layers import transposed_fully_connected
 from util.metrics import cluster_acc, cluster_nmi
 
-from deconv import deconv2d
+#from deconv import deconv2d
 import math
 from sklearn.mixture import BayesianGaussianMixture
 from sklearn.mixture import GaussianMixture
@@ -26,6 +25,7 @@ flags.DEFINE_integer("updates_per_epoch", 600, "number of updates per epoch") #1
 flags.DEFINE_integer("max_epoch", 1000, "max epoch") #100
 flags.DEFINE_float("learning_rate", 0.01, "learning rate")
 flags.DEFINE_string("working_directory", "", "")
+flags.DEFINE_string("logdir", "", "dir for tensorboard logs")
 flags.DEFINE_integer("hidden_size", 50, "size of the hidden VAE unit")
 flags.DEFINE_integer("T", 10, "level of truncation")
 flags.DEFINE_float("lam", 1.0, "weight of the regularizer")
@@ -44,10 +44,10 @@ def variable_summaries(var):
         tf.summary.histogram('histogram', var)
 
 def _weight_variable(name, shape):
-    return tf.get_variable(name, shape, tf.float32, tf.truncated_normal_initializer(stddev=0.1))
+    return tf.get_variable(name, shape, tf.float32, tf.random_normal_initializer(stddev=0.001))
 
 def _bias_variable(name, shape):
-    return tf.get_variable(name, shape, tf.float32, tf.constant_initializer(0.1, dtype=tf.float32))
+    return tf.get_variable(name, shape, tf.float32, tf.constant_initializer(0.0, dtype=tf.float32))
 
 def encoder(input_tensor):
     W_fc1 = _weight_variable('W_1', [784, 500])
@@ -103,7 +103,7 @@ def get_qv_reg_loss(alpha, beta, alpha_0, beta_0):
 def get_qeta_reg_loss(mu, sigma):
     # get the q(\eta|Y) reg loss E_q log \frac{q(\eta|\mu_0, \sigma_0^2)}{q(\eta | Y)}
     mu_0 = tf.zeros([FLAGS.hidden_size, 1])  #parameters of p(\eta) ~ N(mu_0, sigma_0^2 I)
-    sigma_0 = 100.0 # set a big variance so that the data will be learned from data
+    sigma_0 = 100.0 # set a big variance so that the parameters will be learned from data
     return -0.5 * tf.reduce_sum(1 + 2 * tf.log(sigma / sigma_0)
                 - tf.square(sigma) / tf.square(sigma_0)
                 - tf.square(mu - mu_0) / tf.square(sigma_0))
@@ -203,20 +203,20 @@ if __name__ == "__main__":
     with tf.variable_scope("decoder", reuse=True) as scope:
         samples = sample(qeta_mu, sigma_px)
 
-    vae_loss = rec_loss + tf.reduce_sum(0.5 * (tf.square(mean_x) + tf.exp(logcov_x) - logcov_x - 1.0)) / FLAGS.batch_size
+    vae_loss = rec_loss #+ tf.reduce_sum(0.5 * (tf.square(mean_x) + tf.exp(logcov_x) - logcov_x - 1.0)) / FLAGS.batch_size
     overall_loss = qv_reg_loss + qeta_reg_loss + rec_loss + S_loss
     log_p_yt = get_marginal_likelihood(input_tensor, mean_yt, xt, FLAGS.s, qv_alpha, qv_beta, qeta_mu, qeta_sigma, eps, sigma_px)
     # Create optimizers
     encoder_trainables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='encoder')
     decoder_trainables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='decoder')
-
     updates_per_epoch = int(N / FLAGS.batch_size)
 
     # create the optimizer
     global_step = tf.Variable(0, trainable=False)
     #learning_rate = tf.train.exponential_decay(FLAGS.learning_rate, global_step, updates_per_epoch * 50, 1.0, staircase = True)
     optimizer = tf.train.AdamOptimizer(learning_rate = 0.0003, beta1 = 0.95, beta2 = 0.999, epsilon=1.0)
-    pretraining_step = optimizer.minimize(vae_loss, var_list = encoder_trainables + decoder_trainables)
+    pre_optimizer = tf.train.AdamOptimizer(learning_rate = 0.01, beta1 = 0.95, beta2 = 0.999, epsilon=1.0)
+    pretraining_step = pre_optimizer.minimize(vae_loss, var_list = encoder_trainables + decoder_trainables)
     learning_step = optimizer.minimize(overall_loss, var_list = encoder_trainables + decoder_trainables + [qeta_mu, qeta_sigma, qv_alpha, qv_beta], global_step = global_step)
 
     #global_step_vi = tf.Variable(0, trainable=False)
@@ -231,35 +231,38 @@ if __name__ == "__main__":
     tf.summary.scalar('qeta_reg_loss', qeta_reg_loss)
     merged = tf.summary.merge_all()
     loader = tf.train.Saver(encoder_trainables + decoder_trainables + [qv_alpha, qv_beta, qeta_mu, qeta_sigma])
+    logdir = FLAGS.working_directory + 'tb/dp_vae_mnist' + FLAGS.logdir    
 
     init = tf.initialize_all_variables()
     with tf.Session() as sess:
-        train_writer = tf.summary.FileWriter(FLAGS.working_directory + 'tb/dp_vae_mnist/train_relu_beta_1_50', sess.graph)
+        train_writer = tf.summary.FileWriter(logdir, sess.graph)
         sess.run(init)
 
         print("Pretraining the dp-vae model")
-        for iii in range(30):
+        for iii in range(100):
             ve_loss = 0.0
+            mnist_train._index_in_epoch = 0
             for i in range(updates_per_epoch):
                 x, _ = mnist_train.next_batch(FLAGS.batch_size)
                 _, vae_loss_ = sess.run([pretraining_step, vae_loss], {input_tensor: x}) 
                 ve_loss += vae_loss_
             ve_loss /= updates_per_epoch
             print("Pretrain vae loss: %f" % (ve_loss))
+            if iii % 10 == 0:
+                mnist_train._index_in_epoch = 0
+                features = np.zeros([N, FLAGS.hidden_size])
+                labels = np.zeros((N))
+                for i in range(updates_per_epoch):
+                    x, y = mnist_train.next_batch(FLAGS.batch_size)
+                    [mean_x_] = sess.run([mean_x], {input_tensor: x})
+                    features[i * FLAGS.batch_size: (i + 1) * FLAGS.batch_size, :] = mean_x_
+                    labels[i * FLAGS.batch_size: (i + 1) * FLAGS.batch_size] = y
 
-        mnist_train._index_in_epoch = 0
-        features = np.zeros([N, FLAGS.hidden_size])
-        labels = np.zeros((N))
-        for i in range(updates_per_epoch):
-            x, y = mnist_train.next_batch(FLAGS.batch_size)
-            [mean_x_] = sess.run([mean_x], {input_tensor: x})
-            features[i * FLAGS.batch_size: (i + 1) * FLAGS.batch_size, :] = mean_x_
-            labels[i * FLAGS.batch_size: (i + 1) * FLAGS.batch_size] = y
+                model = BayesianGaussianMixture(n_components = FLAGS.T, max_iter = 300, covariance_type = 'diag', weight_concentration_prior=2)
+                model.fit(features)
+                preds = model.predict(features)
+                print("------------> Fit a Bayesian GMM: acc: %f, nmi: %f" % (cluster_acc(preds, labels), cluster_nmi(preds, labels)))
 
-        model = BayesianGaussianMixture(n_components = FLAGS.T, max_iter = 300, covariance_type = 'diag', weight_concentration_prior=2)
-        model.fit(features)
-        preds = model.predict(features)
-        print("------------> Fit a Bayesian GMM: acc: %f, nmi: %f" % (cluster_acc(preds, labels), cluster_nmi(preds, labels)))
         # init other variational distributions
         assign_op = qeta_mu.assign(model.means_.T)
         sess.run(assign_op)
@@ -340,7 +343,7 @@ if __name__ == "__main__":
 
             if epoch % 20 == 0:
                 [imgs] = sess.run([samples])
-                imgs_folder = os.path.join('imgs', str(epoch))
+                imgs_folder = os.path.join(logdir, 'imgs', str(epoch))
                 if not os.path.exists(imgs_folder):
                     os.makedirs(imgs_folder)
                 for k in range(FLAGS.T):
